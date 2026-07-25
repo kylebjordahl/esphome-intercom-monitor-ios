@@ -449,9 +449,7 @@ final class DeviceStore: ObservableObject {
     @discardableResult
     func upsertDiscovered(_ discovered: IntercomDevice) -> Bool {
         guard let index = devices.firstIndex(where: {
-            $0.id == discovered.id
-                || $0.name.compare(discovered.name, options: [.caseInsensitive, .diacriticInsensitive])
-                    == .orderedSame
+            Self.isSameEndpoint($0, discovered)
         }) else {
             devices.append(discovered)
             save()
@@ -472,15 +470,39 @@ final class DeviceStore: ObservableObject {
         updated.rxFormats       = discovered.rxFormats
         updated.extensionNumber = discovered.extensionNumber
 
-        guard updated != existing else { return false }
+        // Host-keyed merging (the old behaviour) could add the same panel twice
+        // when it moved.  Collapse any leftovers so those users don't keep a
+        // dead entry that still shows up in the list and in Siri suggestions.
+        let staleDuplicates = devices.enumerated().filter { offset, candidate in
+            offset != index && Self.isSameEndpoint(candidate, updated)
+        }
+        let removedDuplicates = !staleDuplicates.isEmpty
+
+        guard updated != existing || removedDuplicates else { return false }
+
         if updated.host != existing.host {
             print("DeviceStore: '\(existing.name)' moved \(existing.host) → \(updated.host)")
-        } else {
+        } else if updated != existing {
             print("DeviceStore: '\(existing.name)' metadata refreshed from discovery")
         }
         devices[index] = updated
+        if removedDuplicates {
+            print("DeviceStore: removed \(staleDuplicates.count) duplicate entr" +
+                  "\(staleDuplicates.count == 1 ? "y" : "ies") for '\(updated.name)'")
+            let staleOffsets = Set(staleDuplicates.map(\.offset))
+            devices = devices.enumerated()
+                .filter { !staleOffsets.contains($0.offset) }
+                .map(\.element)
+        }
         save()
         return true
+    }
+
+    /// Identity match used for de-duplication: same stable id, or same name.
+    nonisolated static func isSameEndpoint(_ a: IntercomDevice, _ b: IntercomDevice) -> Bool {
+        a.id == b.id
+            || a.name.compare(b.name, options: [.caseInsensitive, .diacriticInsensitive])
+                == .orderedSame
     }
 
     private func load() {

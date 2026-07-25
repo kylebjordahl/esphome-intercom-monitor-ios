@@ -416,6 +416,18 @@ MainActor.assumeIsolated {
                                                           protocolKind: .voip))
     checkEqual(unchanged, false, "an unchanged rediscovery reports no change")
 
+    // The old host-keyed merge could already have written a duplicate for a
+    // panel that moved; collapse it rather than leaving a dead entry behind.
+    store.add(IntercomDevice(name: "Poppy Monitor", host: "192.168.2.171", protocolKind: .legacy))
+    checkEqual(store.devices.filter { $0.name == "Poppy Monitor" }.count, 2,
+               "precondition: a duplicate exists")
+    store.upsertDiscovered(IntercomDevice(name: "Poppy Monitor", host: "192.168.2.181",
+                                          protocolKind: .voip))
+    checkEqual(store.devices.filter { $0.name.lowercased() == "poppy monitor" }.count, 1,
+               "duplicate entries left by the old merge are collapsed")
+    checkEqual(store.devices.count, 2, "collapsing does not disturb other devices")
+    check(store.devices.contains { $0.name == "Gate" }, "unrelated devices survive de-duplication")
+
     UserDefaults.standard.removeObject(forKey: IntercomDevice.storageKey)
     UserDefaults.standard.removeObject(forKey: "saved_devices_schema")
 }
