@@ -94,9 +94,20 @@ final class HomeAssistantClient: ObservableObject {
 
             if !silent {
                 if parsed.isEmpty {
-                    setStatus("sensor.voip_phonebook exists but has no directly callable " +
-                              "entries. Name-only and group entries route through Home " +
-                              "Assistant and can't be dialled directly by this app.")
+                    // `count` is the roster size HA itself reports, so this
+                    // distinguishes "the roster is genuinely empty" from "it has
+                    // entries this app can't dial directly".
+                    let reported = (attrs["count"] as? Int)
+                        ?? (attrs["count"] as? String).flatMap(Int.init)
+                    if let reported, reported > 0 {
+                        setStatus("sensor.voip_phonebook lists \(reported) entr" +
+                                  "\(reported == 1 ? "y" : "ies") but none carry a direct " +
+                                  "address. Name-only and group entries route through Home " +
+                                  "Assistant, which this app can't dial directly.")
+                    } else {
+                        setStatus("sensor.voip_phonebook exists but is empty. Check that your " +
+                                  "ESP devices are online and publishing their VoIP endpoint.")
+                    }
                 } else {
                     setStatus("\(parsed.count) device(s) found via VoIP Stack phonebook")
                 }
@@ -109,17 +120,48 @@ final class HomeAssistantClient: ObservableObject {
         }
     }
 
-    /// The roster may arrive as a JSON string, or already decoded into an array
-    /// of dictionaries by HA's own JSON handling.  Accept both.
+    /// Parse the roster out of `sensor.voip_phonebook`'s attributes.
+    ///
+    /// VoIP Stack publishes the same roster twice, in two different shapes:
+    ///
+    ///   `roster_json` — the canonical document,
+    ///                   `{"version":2,"capabilities":[…],"contacts":[…]}`
+    ///   `phonebook`   — a compact ESP-oriented string: rows joined with ",",
+    ///                   each `name|ip|sip_port|rtp_port|audio_mode|tx|rx|sip_udp`
+    ///                   (the same shape as a per-device endpoint sensor, minus
+    ///                   the trailing extension field).  A peer with no address
+    ///                   or no usable transport degrades to a bare name.
+    ///
+    /// The JSON is richer, so it wins; the compact string is the fallback.
+    /// Entries that resolve to no address are skipped either way — those are
+    /// name-only or group targets that only Home Assistant can route.
+    /// Test seam for the roster-attribute parsing above, which has repeatedly
+    /// been the layer that silently produced an empty device list.
+    func parseVoipRosterForTesting(_ attributes: [String: Any]) -> [IntercomDevice] {
+        parseVoipRoster(attributes)
+    }
+
     private func parseVoipRoster(_ attributes: [String: Any]) -> [IntercomDevice] {
-        for key in ["contacts", "phonebook", "roster", "entries"] {
+        // 1 — canonical JSON document.
+        if let raw = attributes["roster_json"] as? String, !raw.isEmpty {
+            let parsed = IntercomDevice.fromRosterJSON(raw)
+            if !parsed.isEmpty { return parsed }
+        }
+        // Some HA versions hand back already-decoded JSON rather than a string.
+        for key in ["roster_json", "contacts", "roster", "entries"] {
             if let array = attributes[key] as? [[String: Any]] {
-                return array.compactMap(IntercomDevice.fromRosterEntry)
-            }
-            if let raw = attributes[key] as? String, !raw.isEmpty {
-                let parsed = IntercomDevice.fromRosterJSON(raw)
+                let parsed = array.compactMap(IntercomDevice.fromRosterEntry)
                 if !parsed.isEmpty { return parsed }
             }
+            if let object = attributes[key] as? [String: Any],
+               let contacts = object["contacts"] as? [[String: Any]] {
+                let parsed = contacts.compactMap(IntercomDevice.fromRosterEntry)
+                if !parsed.isEmpty { return parsed }
+            }
+        }
+        // 2 — compact ESP phonebook string.
+        if let raw = attributes["phonebook"] as? String, !raw.isEmpty {
+            return parsePhonebook(raw)
         }
         return []
     }
@@ -311,12 +353,17 @@ final class HomeAssistantClient: ObservableObject {
 
     // MARK: - Parsing
 
+    /// Parse a comma/newline-separated phonebook string.  Rows are shape-detected
+    /// per entry, so a VoIP Stack roster (`name|ip|sip_port|…|sip_udp`) and a
+    /// legacy one (`name|tcp|ip|port`) both work — including a mixed list, which
+    /// is what a house running two firmware generations produces.  Bare-name rows
+    /// (a peer with no direct address) yield nothing and are skipped.
     private func parsePhonebook(_ phonebook: String) -> [IntercomDevice] {
         phonebook
             .components(separatedBy: CharacterSet(charactersIn: ",\n"))
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty }
-            .compactMap { IntercomDevice.fromPhonebookEntry($0) }
+            .compactMap { IntercomDevice.fromEndpointState($0) }
     }
 
     // MARK: - Endpoint registration

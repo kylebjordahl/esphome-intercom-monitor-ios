@@ -373,6 +373,77 @@ do {
                "a hand-pinned legacy device is not re-armed at the current schema")
 }
 
+// MARK: - voip_phonebook attribute shapes
+
+print("\nsensor.voip_phonebook parsing")
+MainActor.assumeIsolated {
+    let client = HomeAssistantClient()
+
+    // Exactly what VoipPhonebookSensor.extra_state_attributes publishes:
+    // roster_json is the canonical document, phonebook is the compact ESP
+    // string built by format_entry_unified() and joined with ",".
+    let rosterJSON = """
+    {"version":2,"capabilities":["extension","ring_group"],"contacts":[
+      {"id":"poppy","name":"Poppy Monitor","address":"192.168.2.180",
+       "sip_uri":"sip:Poppy Monitor@192.168.2.180:5060","extension":"201","port":5060,
+       "metadata":{"sip_transport":"udp","sip_port":5060,"rtp_port":40000,
+                   "tx_format":"16000:s16le:1:20","rx_format":"16000:s16le:1:20"}},
+      {"id":"allrooms","name":"AllRooms","address":"","sip_uri":"","ha_bridge":true,
+       "metadata":{"group_type":"ring","members":["Poppy Monitor"]}}
+    ]}
+    """
+    let fromJSON = client.parseVoipRosterForTesting(["roster_json": rosterJSON,
+                                                     "phonebook": "",
+                                                     "count": 2])
+    checkEqual(fromJSON.count, 1, "roster_json is read and the group entry skipped")
+    checkEqual(fromJSON.first?.name, "Poppy Monitor", "roster_json entry name")
+    checkEqual(fromJSON.first?.host, "192.168.2.180", "roster_json entry address")
+    checkEqual(fromJSON.first?.protocolKind, .voip, "roster_json entries are voip")
+
+    // The compact fallback. Note this row has 8 fields — no trailing extension,
+    // unlike the per-device endpoint sensor.
+    let compact = "Poppy Monitor|192.168.2.180|5060|40000|full_duplex|" +
+                  "16000:s16le:1:20;16000:s16le:1:32|16000:s16le:1:20|sip_udp"
+    let fromCompact = client.parseVoipRosterForTesting(["phonebook": compact, "count": 1])
+    checkEqual(fromCompact.count, 1, "falls back to the compact phonebook string")
+    checkEqual(fromCompact.first?.host, "192.168.2.180", "compact row address")
+    checkEqual(fromCompact.first?.sipPort, 5060, "compact row SIP port")
+    checkEqual(fromCompact.first?.sipTransport, .udp, "compact row transport")
+    checkEqual(fromCompact.first?.protocolKind, .voip, "compact rows are voip")
+
+    // Several rows, comma-joined, including a bare-name peer that has no direct
+    // address (format_entry_unified returns just the name for those).
+    let multi = "\(compact),AllRooms,Gate|192.168.2.190|5060|40000|full_duplex|" +
+                "16000:s16le:1:20|16000:s16le:1:20|sip_tcp"
+    let fromMulti = client.parseVoipRosterForTesting(["phonebook": multi, "count": 3])
+    checkEqual(fromMulti.count, 2, "bare-name rows are skipped, addressable rows kept")
+    checkEqual(fromMulti.last?.sipTransport, .tcp, "sip_tcp row parses as TCP")
+
+    // A mixed-generation house: legacy and voip rows in one string.
+    let mixed = "OldPanel|tcp|192.168.2.50|6054,\(compact)"
+    let fromMixed = client.parseVoipRosterForTesting(["phonebook": mixed, "count": 2])
+    checkEqual(fromMixed.count, 2, "mixed legacy + voip rows both parse")
+    checkEqual(fromMixed.first?.protocolKind, .legacy, "legacy row keeps the legacy protocol")
+    checkEqual(fromMixed.last?.protocolKind, .voip, "voip row keeps the voip protocol")
+
+    // roster_json wins when both are present and usable.
+    let both = client.parseVoipRosterForTesting(["roster_json": rosterJSON,
+                                                 "phonebook": compact, "count": 2])
+    checkEqual(both.first?.extensionNumber, "201",
+               "roster_json is preferred over the compact string")
+
+    // Already-decoded JSON, which some HA versions hand back instead of a string.
+    let decoded: [String: Any] = ["roster_json": ["version": 2, "contacts": [
+        ["id": "gate", "name": "Gate", "address": "192.168.2.190",
+         "metadata": ["sip_transport": "udp", "sip_port": 5060]]
+    ]]]
+    checkEqual(client.parseVoipRosterForTesting(decoded).first?.name, "Gate",
+               "pre-decoded roster_json is handled")
+
+    checkEqual(client.parseVoipRosterForTesting(["phonebook": "", "count": 0]).count, 0,
+               "an empty roster yields nothing")
+}
+
 // MARK: - Discovery reconciliation
 
 print("\nDeviceStore.upsertDiscovered")
