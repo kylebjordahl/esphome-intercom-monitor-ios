@@ -456,7 +456,9 @@ MainActor.assumeIsolated {
     """
 
     let devices = client.parseVoipRosterForTesting(["roster_json": liveRosterJSON, "count": 4])
-    checkEqual(devices.count, 2, "two addressable endpoints, two HA groups skipped")
+    // Four contacts: one ESP panel, one HA browser softphone, two HA groups.
+    // Only the ESP panel is an intercom this app should list.
+    checkEqual(devices.count, 1, "only the ESP panel is listed")
 
     guard let poppy = devices.first(where: { $0.name == "Poppy Monitor" }) else {
         check(false, "Poppy Monitor is discovered"); exit(1)
@@ -487,12 +489,30 @@ MainActor.assumeIsolated {
     check(poppy.parsedRxFormats.contains { $0.isNativeToAudioEngine },
           "ESP accepts a format AudioEngine produces natively")
 
-    // The HA browser softphone is a legitimate SIP target, over TCP.
-    guard let patton = devices.first(where: { $0.name == "Patton Mannor" }) else {
-        check(false, "HA softphone is discovered"); exit(1)
-    }
-    checkEqual(patton.sipTransport, .tcp, "HA softphone uses SIP/TCP")
-    checkEqual(patton.preferredFrameMs, 10, "HA softphone ptime negotiated")
+    // The HA browser softphone is a valid SIP target but not an intercom panel.
+    check(!devices.contains { $0.name == "Patton Mannor" },
+          "the HA browser softphone is not listed as a panel")
+    // Both markers should independently suffice, since only one may be present.
+    let byLocalHA = """
+    {"version":2,"contacts":[{"name":"HA","address":"192.168.7.148","enabled":true,
+     "metadata":{"local_ha":true,"sip_port":5060,"sip_transport":"tcp"}}]}
+    """
+    checkEqual(client.parseVoipRosterForTesting(["roster_json": byLocalHA]).count, 0,
+               "local_ha alone filters the softphone")
+    let byKind = """
+    {"version":2,"contacts":[{"name":"HA","address":"192.168.7.148","enabled":true,
+     "metadata":{"endpoint_kind":"browser","sip_port":5060,"sip_transport":"tcp"}}]}
+    """
+    checkEqual(client.parseVoipRosterForTesting(["roster_json": byKind]).count, 0,
+               "endpoint_kind=browser alone filters the softphone")
+    // An ESPHome endpoint must not be caught by that filter.
+    let esphomeKind = """
+    {"version":2,"contacts":[{"name":"Panel","address":"192.168.7.173","enabled":true,
+     "metadata":{"endpoint_kind":"esphome","local_ha":false,"sip_port":5060,
+                 "sip_transport":"udp"}}]}
+    """
+    checkEqual(client.parseVoipRosterForTesting(["roster_json": esphomeKind]).count, 1,
+               "an esphome endpoint is still listed")
 
     // Groups route through HA and cannot be dialled directly by this client.
     check(!devices.contains { $0.name == "CG Casa" }, "conference group is not a direct target")
@@ -507,10 +527,13 @@ MainActor.assumeIsolated {
         "48000:s16le:2:20;48000:s16le:1:20;48000:s16le:1:10;32000:s16le:1:16;32000:s16le:1:10;16000:s16le:1:16;16000:s16le:1:10;16000:s16le:1:20|sip_tcp"
 
     let compactDevices = client.parseVoipRosterForTesting(["phonebook": livePhonebook, "count": 2])
-    checkEqual(compactDevices.count, 2, "the compact attribute yields the same endpoints")
     checkEqual(compactDevices.first?.host, "192.168.7.173", "compact ESP address")
     checkEqual(compactDevices.first?.preferredFrameMs, 10, "compact path negotiates the same ptime")
-    checkEqual(compactDevices.last?.sipTransport, .tcp, "compact path keeps TCP for the softphone")
+    // Known limitation: the compact rows carry no local_ha / endpoint_kind, so
+    // the softphone cannot be identified there. roster_json is preferred
+    // precisely because it does carry that metadata; this fallback only runs
+    // when roster_json is absent or unparseable.
+    checkEqual(compactDevices.count, 2, "compact rows lack the metadata to filter the softphone")
 
     // A disabled roster row is not offered as a target.
     let disabled = """

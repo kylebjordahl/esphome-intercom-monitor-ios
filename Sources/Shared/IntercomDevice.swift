@@ -190,6 +190,16 @@ struct IntercomDevice: Identifiable, Codable, Hashable, Sendable {
             return nil
         }
 
+        // Home Assistant publishes its own browser softphone as a roster contact.
+        // It is a genuine SIP target, but it is not an intercom panel, so it
+        // doesn't belong in this app's device list.
+        let endpointKind = (metadata["endpoint_kind"] as? String)?.lowercased()
+        if (metadata["local_ha"] as? Bool) == true || endpointKind == "browser" {
+            print("IntercomDevice: roster entry '\(name)' skipped — " +
+                  "Home Assistant softphone (kind=\(endpointKind ?? "local_ha"))")
+            return nil
+        }
+
         // Host: prefer the explicit address, else the host part of the SIP URI.
         var host = (raw["address"] as? String)?.trimmingCharacters(in: .whitespaces) ?? ""
         if host.isEmpty, let sipURI { host = hostPart(ofSipURI: sipURI) ?? "" }

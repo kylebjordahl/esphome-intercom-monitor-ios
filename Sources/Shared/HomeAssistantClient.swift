@@ -101,9 +101,11 @@ final class HomeAssistantClient: ObservableObject {
                         ?? (attrs["count"] as? String).flatMap(Int.init)
                     if let reported, reported > 0 {
                         setStatus("sensor.voip_phonebook lists \(reported) entr" +
-                                  "\(reported == 1 ? "y" : "ies") but none carry a direct " +
-                                  "address. Name-only and group entries route through Home " +
-                                  "Assistant, which this app can't dial directly.")
+                                  "\(reported == 1 ? "y" : "ies"), but none are intercom " +
+                                  "panels this app can dial directly — ring/conference " +
+                                  "groups and the Home Assistant softphone are excluded. " +
+                                  "If a panel is missing, check it is online and publishing " +
+                                  "its VoIP endpoint.")
                     } else {
                         setStatus("sensor.voip_phonebook exists but is empty. Check that your " +
                                   "ESP devices are online and publishing their VoIP endpoint.")
