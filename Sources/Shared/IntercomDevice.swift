@@ -170,8 +170,18 @@ struct IntercomDevice: Identifiable, Codable, Hashable, Sendable {
               !name.isEmpty
         else { return nil }
 
+        // A roster row that HA hasn't been given an explicit URI for carries
+        // `"sip_uri": ""` rather than omitting the key.  Normalise that to nil —
+        // an empty string is not a usable URI, and letting it through means
+        // `sipURI ?? synthesised` picks the empty string and we send an INVITE
+        // with a blank Request-URI.
         let metadata = raw["metadata"] as? [String: Any] ?? [:]
-        let sipURI   = (raw["sip_uri"] as? String)?.trimmingCharacters(in: .whitespaces)
+        let sipURI   = (raw["sip_uri"] as? String)?
+            .trimmingCharacters(in: .whitespaces)
+            .nilIfEmpty
+
+        // Entries can be disabled in HA without being removed from the roster.
+        if let enabled = raw["enabled"] as? Bool, !enabled { return nil }
 
         // Host: prefer the explicit address, else the host part of the SIP URI.
         var host = (raw["address"] as? String)?.trimmingCharacters(in: .whitespaces) ?? ""
@@ -344,6 +354,13 @@ struct IntercomDevice: Identifiable, Codable, Hashable, Sendable {
         }
         return nil
     }
+}
+
+extension String {
+    /// Treat a blank string as absent.  Home Assistant's roster uses `""` for
+    /// "not set" throughout rather than omitting keys, so this distinction
+    /// matters wherever a value feeds straight onto the wire.
+    var nilIfEmpty: String? { isEmpty ? nil : self }
 }
 
 // MARK: - Stable identifiers

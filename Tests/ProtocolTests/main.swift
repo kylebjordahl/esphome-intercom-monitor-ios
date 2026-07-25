@@ -444,6 +444,83 @@ MainActor.assumeIsolated {
                "an empty roster yields nothing")
 }
 
+// MARK: - Real roster captured from a live v2026.8.0 install
+
+print("\nLive roster fixture")
+MainActor.assumeIsolated {
+    let client = HomeAssistantClient()
+
+    // Verbatim from Developer Tools → States → sensor.voip_phonebook.
+    let liveRosterJSON = """
+    {"capabilities":["extension","ring_group","conference_group","conference_ring"],"contacts":[{"address":"192.168.7.173","enabled":true,"extension":"","ha_bridge":false,"id":"Poppy Monitor","metadata":{"audio_mode":"full_duplex","capabilities":["audio","dtmf"],"conference_group":"CG Casa","conference_ring":false,"device_id":"3484e3d6649858fab912c870f3e91de4","endpoint_id":"esphome:3484e3d6649858fab912c870f3e91de4","endpoint_kind":"esphome","local_ha":false,"ring_group":"RG Casa","rtp_port":40000,"rx_formats":["48000:s16le:1:10","32000:s16le:1:16","16000:s16le:1:10","16000:s16le:1:16","16000:s16le:1:32"],"sip_port":5060,"sip_transport":"udp","tx_formats":["16000:s16le:1:16","16000:s16le:1:10"]},"name":"Poppy Monitor","number":"","port":5060,"sip_uri":""},{"address":"192.168.7.148","enabled":true,"extension":"","ha_bridge":false,"id":"Patton Mannor","metadata":{"audio_mode":"full_duplex","capabilities":["audio","dtmf"],"conference_group":"","conference_ring":false,"device_id":"0aebd073ca623fa256a9c68b3e0b02c2","endpoint_id":"default","endpoint_kind":"browser","local_ha":true,"ring_group":"","rtp_port":40000,"rx_formats":["48000:s16le:2:20","48000:s16le:1:20","48000:s16le:1:10","32000:s16le:1:16","32000:s16le:1:10","16000:s16le:1:16","16000:s16le:1:10","16000:s16le:1:20"],"sip_port":5060,"sip_transport":"tcp","tx_formats":["48000:s16le:2:20","48000:s16le:1:20","48000:s16le:1:10","32000:s16le:1:16","32000:s16le:1:10","16000:s16le:1:16","16000:s16le:1:10","16000:s16le:1:20"]},"name":"Patton Mannor","number":"","port":5060,"sip_uri":""},{"address":"","enabled":true,"extension":"","ha_bridge":true,"id":"CG Casa","metadata":{"auto":true,"group_type":"conference","members":["Poppy Monitor"],"ring_members":[]},"name":"CG Casa","number":"","port":0,"sip_uri":""},{"address":"","enabled":true,"extension":"","ha_bridge":true,"id":"RG Casa","metadata":{"auto":true,"group_type":"ring","members":["Poppy Monitor"],"ring_members":[]},"name":"RG Casa","number":"","port":0,"sip_uri":""}],"version":2}
+    """
+
+    let devices = client.parseVoipRosterForTesting(["roster_json": liveRosterJSON, "count": 4])
+    checkEqual(devices.count, 2, "two addressable endpoints, two HA groups skipped")
+
+    guard let poppy = devices.first(where: { $0.name == "Poppy Monitor" }) else {
+        check(false, "Poppy Monitor is discovered"); exit(1)
+    }
+    checkEqual(poppy.host, "192.168.7.173", "ESP address")
+    checkEqual(poppy.sipPort, 5060, "ESP SIP port from metadata")
+    checkEqual(poppy.sipTransport, .udp, "ESP SIP transport from metadata")
+    checkEqual(poppy.rtpPort, 40_000, "ESP RTP port from metadata")
+    checkEqual(poppy.protocolKind, .voip, "ESP entry is voip")
+    // The roster carries formats as JSON arrays under the *plural* keys.
+    checkEqual(poppy.txFormats.count, 2, "tx_formats array parsed")
+    checkEqual(poppy.rxFormats.count, 5, "rx_formats array parsed")
+
+    // Every entry has "sip_uri": "" — an empty string, not a missing key. If that
+    // reaches SIPCall the INVITE goes out with a blank Request-URI.
+    check(poppy.sipURI == nil, "an empty sip_uri is normalised to nil, not kept as \"\"")
+
+    // Packet time is the make-or-break detail for this device: it can only SEND
+    // 16 ms or 10 ms frames, so the default 20 ms offer would earn a 488.
+    checkEqual(Set(poppy.parsedTxFormats.map(\.frameMs)), Set([16, 10]), "ESP tx ptimes")
+    checkEqual(Set(poppy.parsedRxFormats.map(\.frameMs)), Set([10, 16, 32]), "ESP rx ptimes")
+    checkEqual(poppy.preferredFrameMs, 10, "negotiates a ptime the ESP supports in both directions")
+    check(poppy.preferredFrameMs != 20, "does not fall back to the unsupported 20 ms default")
+
+    // 16 kHz mono is present in both directions, so no resampling is needed.
+    check(poppy.parsedTxFormats.contains { $0.isNativeToAudioEngine },
+          "ESP can send a format AudioEngine renders natively")
+    check(poppy.parsedRxFormats.contains { $0.isNativeToAudioEngine },
+          "ESP accepts a format AudioEngine produces natively")
+
+    // The HA browser softphone is a legitimate SIP target, over TCP.
+    guard let patton = devices.first(where: { $0.name == "Patton Mannor" }) else {
+        check(false, "HA softphone is discovered"); exit(1)
+    }
+    checkEqual(patton.sipTransport, .tcp, "HA softphone uses SIP/TCP")
+    checkEqual(patton.preferredFrameMs, 10, "HA softphone ptime negotiated")
+
+    // Groups route through HA and cannot be dialled directly by this client.
+    check(!devices.contains { $0.name == "CG Casa" }, "conference group is not a direct target")
+    check(!devices.contains { $0.name == "RG Casa" }, "ring group is not a direct target")
+
+    // The compact attribute from the same install must agree with the JSON.
+    let livePhonebook = "Poppy Monitor|192.168.7.173|5060|40000|full_duplex|" +
+        "16000:s16le:1:16;16000:s16le:1:10|" +
+        "48000:s16le:1:10;32000:s16le:1:16;16000:s16le:1:10;16000:s16le:1:16;16000:s16le:1:32|sip_udp," +
+        "Patton Mannor|192.168.7.148|5060|40000|full_duplex|" +
+        "48000:s16le:2:20;48000:s16le:1:20;48000:s16le:1:10;32000:s16le:1:16;32000:s16le:1:10;16000:s16le:1:16;16000:s16le:1:10;16000:s16le:1:20|" +
+        "48000:s16le:2:20;48000:s16le:1:20;48000:s16le:1:10;32000:s16le:1:16;32000:s16le:1:10;16000:s16le:1:16;16000:s16le:1:10;16000:s16le:1:20|sip_tcp"
+
+    let compactDevices = client.parseVoipRosterForTesting(["phonebook": livePhonebook, "count": 2])
+    checkEqual(compactDevices.count, 2, "the compact attribute yields the same endpoints")
+    checkEqual(compactDevices.first?.host, "192.168.7.173", "compact ESP address")
+    checkEqual(compactDevices.first?.preferredFrameMs, 10, "compact path negotiates the same ptime")
+    checkEqual(compactDevices.last?.sipTransport, .tcp, "compact path keeps TCP for the softphone")
+
+    // A disabled roster row is not offered as a target.
+    let disabled = """
+    {"version":2,"contacts":[{"name":"Old","address":"192.168.7.99","enabled":false,
+     "metadata":{"sip_port":5060,"sip_transport":"udp"}}]}
+    """
+    checkEqual(client.parseVoipRosterForTesting(["roster_json": disabled]).count, 0,
+               "a disabled entry is skipped")
+}
+
 // MARK: - Discovery reconciliation
 
 print("\nDeviceStore.upsertDiscovered")

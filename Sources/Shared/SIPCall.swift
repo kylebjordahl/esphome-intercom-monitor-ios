@@ -112,7 +112,9 @@ final class SIPCall {
 
         let contactPort = endpoint.localPort
         self.localURI     = "sip:\(Self.uriUser(callerName))@\(endpoint.localAddress):\(contactPort)"
-        self.remoteURI    = device.sipURI
+        // Belt and braces: the roster commonly carries an empty `sip_uri`, and a
+        // blank Request-URI would produce a malformed INVITE.
+        self.remoteURI = device.sipURI?.trimmingCharacters(in: .whitespaces).nilIfEmpty
             ?? "sip:\(Self.uriUser(device.name))@\(device.host):\(device.sipPort)"
         self.remoteTarget = self.remoteURI
     }
