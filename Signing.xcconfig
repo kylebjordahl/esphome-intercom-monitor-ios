@@ -1,0 +1,25 @@
+// Base code-signing config — COMMITTED. Referenced by project.yml (`configFiles`).
+//
+// This file is intentionally value-free so the repo carries no personal Team ID.
+// Your actual Team ID goes in `Signing.local.xcconfig` (gitignored). The
+// `#include?` below (note the `?`) pulls it in when present and is silently
+// skipped when absent — so `xcodegen generate` works on a fresh clone with no
+// local file, and device builds auto-sign once you create one.
+//
+// Setup (one time):
+//   echo 'DEVELOPMENT_TEAM = XXXXXXXXXX' > Signing.local.xcconfig   # your Team ID
+//   xcodegen generate
+//
+// Find your 10-char Team ID in Xcode → Settings → Accounts (select your team), or:
+//   security find-certificate -c "Apple Development: <you>" -p \
+//     | openssl x509 -noout -subject      # the OU=... value is your Team ID
+
+DEVELOPMENT_TEAM =
+
+// Base bundle identifier for the app. The widget and watch targets derive their
+// IDs from this (`$(APP_BUNDLE_ID).widgets` / `.watchkitapp`) in project.yml.
+// Override in Signing.local.xcconfig with your own reverse-DNS ID — it must
+// match an App ID registered to your team, or device signing will fail.
+APP_BUNDLE_ID = com.intercomlistener.app
+
+#include? "Signing.local.xcconfig"
