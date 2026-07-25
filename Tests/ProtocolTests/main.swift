@@ -345,6 +345,34 @@ do {
     checkEqual(reloaded.first?.sipTransport, .tcp, "voip devices persist their transport")
 }
 
+// MARK: - Persisted-store migration
+
+print("\nDeviceStore.migrate")
+do {
+    // The pre-fix build wrote protocolKind explicitly on every save, so simply
+    // changing the decode default could not reach devices already on disk.
+    let stored = [
+        IntercomDevice(name: "Poppy Monitor", host: "192.168.2.171", protocolKind: .legacy),
+        IntercomDevice(name: "Salotto", host: "192.168.1.52", protocolKind: .voip),
+        IntercomDevice(name: "Manual", host: "192.168.1.99", protocolKind: .auto),
+    ]
+
+    let migrated = DeviceStore.migrate(stored, fromSchema: 0)
+    checkEqual(migrated[0].protocolKind, .auto, "legacy-pinned device is re-armed for probing")
+    checkEqual(migrated[1].protocolKind, .voip, "voip devices are left alone")
+    checkEqual(migrated[2].protocolKind, .auto, "auto devices are left alone")
+    checkEqual(migrated.count, stored.count, "migration preserves the roster")
+    checkEqual(migrated[0].host, "192.168.2.171", "migration preserves addressing")
+
+    // Schema 1 is the pre-fix build; it needs the same treatment.
+    checkEqual(DeviceStore.migrate(stored, fromSchema: 1)[0].protocolKind, .auto,
+               "schema 1 stores are migrated too")
+
+    // Once migrated, a deliberate user choice must survive.
+    checkEqual(DeviceStore.migrate(stored, fromSchema: 2)[0].protocolKind, .legacy,
+               "a hand-pinned legacy device is not re-armed at the current schema")
+}
+
 // MARK: - SIP URI user part
 
 print("\nSIPCall.uriUser")
@@ -399,6 +427,16 @@ do {
     checkEqual(roundTrip?.sipPort, 5060, "advertised SIP port matches the listener")
     checkEqual(Int(RTPAudioSession.basePort), roundTrip?.rtpPort,
                "advertised RTP port matches the first port we actually bind")
+
+    // When 5060 is taken we bind elsewhere; the advertisement has to follow, or
+    // peers call a port nothing is listening on.
+    let ephemeral = HomeAssistantClient.voipEndpointState(name: "iPhone",
+                                                          ip: "192.168.1.10",
+                                                          sipPort: 54321)
+    checkEqual(ephemeral.components(separatedBy: "|")[2], "54321",
+               "advertises the actually-bound SIP port, not the convention")
+    checkEqual(IntercomDevice.fromVoipEndpointString(ephemeral)?.sipPort, 54321,
+               "ephemeral-port advertisement still parses")
 }
 
 print("\n\(checks - failures)/\(checks) checks passed")

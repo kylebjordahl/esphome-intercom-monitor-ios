@@ -126,6 +126,20 @@ final class IntercomSession: NSObject, ObservableObject {
                      haClient: HomeAssistantClient) {
         server.start(deviceName: name)
 
+        // The SIP listener may not get the conventional 5060 (something else on
+        // the device can hold it), and the port it does get is what peers must
+        // call.  Re-advertise once the real port is known rather than publishing
+        // 5060 and hoping.
+        sipEndpoint.onListeningChanged = { [weak self] in
+            guard let self, let ip = localWiFiIPAddress() else { return }
+            Task {
+                await haClient.registerEndpoint(baseURL: haBaseURL, token: haToken,
+                                                name: name, ip: ip,
+                                                port: Int(IntercomServer.listenPort),
+                                                sipPort: Int(self.sipEndpoint.localPort))
+            }
+        }
+
         // Register our endpoint in HA so intercom_native / VoIP Stack can add us
         // to the phonebook, and bring up the SIP listener on the same address we
         // advertise (Via/Contact/SDP all have to agree with it).
@@ -134,7 +148,8 @@ final class IntercomSession: NSObject, ObservableObject {
             sipEndpoint.start(localName: name, address: ip)
             await haClient.registerEndpoint(baseURL: haBaseURL, token: haToken,
                                             name: name, ip: ip,
-                                            port: Int(IntercomServer.listenPort))
+                                            port: Int(IntercomServer.listenPort),
+                                            sipPort: Int(sipEndpoint.localPort))
         }
     }
 

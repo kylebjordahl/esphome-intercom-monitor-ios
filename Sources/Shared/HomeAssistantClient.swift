@@ -324,8 +324,12 @@ final class HomeAssistantClient: ObservableObject {
     /// Publishes this device as sensor.intercom_<slug>_endpoint in HA.
     /// intercom_native will pick it up if it scans all *_intercom_endpoint entities,
     /// and it will also appear in our own fallback discovery scan.
+    /// `sipPort` is the port the SIP endpoint actually bound, which is not
+    /// necessarily 5060 — see SIPEndpoint's ephemeral fallback.  Advertising the
+    /// conventional port when we're listening elsewhere makes us uncallable.
     func registerEndpoint(baseURL: String, token: String,
-                          name: String, ip: String, port: Int) async {
+                          name: String, ip: String, port: Int,
+                          sipPort: Int = Int(SIPEndpoint.defaultPort)) async {
         let slug = Self.slug(name)
 
         // Legacy registration — keeps pre-2026.7 installs working unchanged.
@@ -339,7 +343,7 @@ final class HomeAssistantClient: ObservableObject {
         //   Name|host|sip_port|rtp_port|audio_mode|tx|rx|sip_udp|extension
         await postState(baseURL: baseURL, token: token,
                         entityId: "sensor.voip_\(slug)_endpoint",
-                        state: Self.voipEndpointState(name: name, ip: ip),
+                        state: Self.voipEndpointState(name: name, ip: ip, sipPort: sipPort),
                         friendlyName: "\(name) VoIP Endpoint")
     }
 
@@ -351,11 +355,12 @@ final class HomeAssistantClient: ObservableObject {
         VoipAudioFormat.preferredFrameMs.map { VoipAudioFormat.appDefault(frameMs: $0) }
     }
 
-    nonisolated static func voipEndpointState(name: String, ip: String) -> String {
+    nonisolated static func voipEndpointState(name: String, ip: String,
+                                              sipPort: Int = Int(SIPEndpoint.defaultPort)) -> String {
         let formats = VoipAudioFormat.encodeList(advertisedFormats)
         return [name,
                 ip,
-                String(SIPEndpoint.defaultPort),
+                String(sipPort),
                 String(RTPAudioSession.basePort),
                 "full_duplex",
                 formats,

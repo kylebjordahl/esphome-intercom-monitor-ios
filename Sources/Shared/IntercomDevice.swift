@@ -383,7 +383,34 @@ final class DeviceStore: ObservableObject {
 
     private let key = IntercomDevice.storageKey
 
+    /// Bumped whenever persisted devices need rewriting on load.  Changing the
+    /// decode default is not enough on its own: discovery re-saves the roster
+    /// (see App.swift / SettingsView), so a stale value gets written back
+    /// explicitly and then wins over any new default forever.
+    private static let currentSchema = 2
+    private let schemaKey = "saved_devices_schema"
+
     init() { load() }
+
+    /// Rewrite devices persisted by an older build.
+    ///
+    /// Schema < 2 stamped every pre-existing device `.legacy`, on the assumption
+    /// that anything already saved was a legacy panel.  That strands a panel
+    /// upgraded past v2026.7.0: `.legacy` disables the SIP probe, so the app
+    /// retries a port the firmware no longer opens and gives up.  Re-arm those
+    /// devices as `.auto`, which still tries legacy first.
+    ///
+    /// Anything the user pins by hand afterwards is written at the current
+    /// schema and is left alone.
+    nonisolated static func migrate(_ devices: [IntercomDevice],
+                                    fromSchema schema: Int) -> [IntercomDevice] {
+        guard schema < 2 else { return devices }
+        return devices.map { device in
+            var device = device
+            if device.protocolKind == .legacy { device.protocolKind = .auto }
+            return device
+        }
+    }
 
     func add(_ device: IntercomDevice) {
         devices.append(device)
@@ -408,14 +435,31 @@ final class DeviceStore: ObservableObject {
     }
 
     private func load() {
+        let schema = UserDefaults.standard.integer(forKey: schemaKey)   // 0 when never written
         guard let data = UserDefaults.standard.data(forKey: key),
               let decoded = try? JSONDecoder().decode([IntercomDevice].self, from: data)
-        else { return }
-        devices = decoded
+        else {
+            UserDefaults.standard.set(Self.currentSchema, forKey: schemaKey)
+            return
+        }
+
+        if schema < Self.currentSchema {
+            let migrated = Self.migrate(decoded, fromSchema: schema)
+            let rearmed = zip(decoded, migrated).filter { $0.protocolKind != $1.protocolKind }.count
+            if rearmed > 0 {
+                print("DeviceStore: migrated \(rearmed) device(s) from schema \(schema) " +
+                      "— legacy-pinned entries re-armed for protocol probing")
+            }
+            devices = migrated
+            save()   // stamps the new schema
+        } else {
+            devices = decoded
+        }
     }
 
     private func save() {
         guard let data = try? JSONEncoder().encode(devices) else { return }
         UserDefaults.standard.set(data, forKey: key)
+        UserDefaults.standard.set(Self.currentSchema, forKey: schemaKey)
     }
 }
