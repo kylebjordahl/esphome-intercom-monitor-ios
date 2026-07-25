@@ -485,6 +485,16 @@ final class IntercomConnection: ObservableObject, Identifiable {
     /// client-side: a server-side connection can't dial the remote panel back,
     /// so it just has to wait for the panel to redial us.
     private func handleUnexpectedDrop() {
+        // A refused connection surfaces through the receive completion handler
+        // *before* NWConnection reports .failed, so the probe decision has to be
+        // made here too.  Without this an .auto device burns all five reconnect
+        // attempts against a legacy port that no longer exists, then gives up —
+        // which is exactly what a v2026.7.0+ panel does to a legacy connect.
+        if isProbing, !isServerSide {
+            switchToVoIPAfterProbe()
+            return
+        }
+
         pingTimer?.invalidate()
         pingTimer = nil
         stopAudioKeepalive()

@@ -333,7 +333,9 @@ do {
     """
     let decoded = try JSONDecoder().decode([IntercomDevice].self, from: Data(oldJSON.utf8))
     checkEqual(decoded.count, 1, "decodes a pre-upgrade saved roster")
-    checkEqual(decoded.first?.protocolKind, .legacy, "pre-upgrade devices default to legacy")
+    // Must be .auto, not .legacy: a panel saved before this update may since have
+    // been upgraded past v2026.7.0, and .legacy would strand it permanently.
+    checkEqual(decoded.first?.protocolKind, .auto, "pre-upgrade devices probe rather than assume legacy")
     checkEqual(decoded.first?.sipPort, 5060, "pre-upgrade devices get a default SIP port")
 
     // And the new shape must survive a save/load cycle.
@@ -341,6 +343,24 @@ do {
     let reloaded  = try JSONDecoder().decode([IntercomDevice].self, from: reencoded)
     checkEqual(reloaded.first?.protocolKind, .voip, "voip devices persist their protocol")
     checkEqual(reloaded.first?.sipTransport, .tcp, "voip devices persist their transport")
+}
+
+// MARK: - SIP URI user part
+
+print("\nSIPCall.uriUser")
+do {
+    // The roster addresses panels by their exact name, and VoIP Stack validates
+    // the Request-URI — so the name must survive, not be slugified.
+    checkEqual(SIPCall.uriUser("Kitchen"), "Kitchen", "preserves a simple name verbatim")
+    checkEqual(SIPCall.uriUser("Poppy Monitor"), "Poppy%20Monitor", "escapes a space rather than lowercasing")
+    checkEqual(SIPCall.uriUser("Salotto"), "Salotto", "preserves capitalisation")
+    checkEqual(SIPCall.uriUser("Front-Door_2"), "Front-Door_2", "keeps unreserved punctuation")
+    checkEqual(SIPCall.uriUser(""), "phone", "falls back for an empty name")
+    checkEqual(SIPCall.uriUser("Caffè"), "Caff%C3%A8", "percent-escapes non-ASCII as UTF-8")
+    // Whatever we emit has to survive our own URI parsing.
+    let uri = "sip:\(SIPCall.uriUser("Poppy Monitor"))@192.168.2.171:5060"
+    checkEqual(IntercomDevice.hostPart(ofSipURI: uri), "192.168.2.171", "escaped user part still parses")
+    checkEqual(IntercomDevice.portPart(ofSipURI: uri), 5060, "escaped user part keeps the port parseable")
 }
 
 // MARK: - RTP payload conversion

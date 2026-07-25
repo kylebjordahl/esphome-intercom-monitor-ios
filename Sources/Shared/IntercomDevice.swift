@@ -110,9 +110,13 @@ struct IntercomDevice: Identifiable, Codable, Hashable, Sendable {
         host = try c.decode(String.self, forKey: .host)
         port = try c.decode(Int.self, forKey: .port)
 
-        // A device saved before VoIP support existed is, by definition, one the
-        // user was talking to over the legacy protocol.
-        protocolKind = try c.decodeIfPresent(DeviceProtocol.self, forKey: .protocolKind) ?? .legacy
+        // A device saved before VoIP support existed was reached over the legacy
+        // protocol *at the time it was saved* — but the panel may have been
+        // upgraded since, which is the common case for anyone installing this
+        // update.  `.auto` still tries legacy first, so a genuinely old panel
+        // behaves exactly as before; it just gains a SIP fallback instead of
+        // failing permanently after a firmware upgrade.
+        protocolKind = try c.decodeIfPresent(DeviceProtocol.self, forKey: .protocolKind) ?? .auto
         sipURI       = try c.decodeIfPresent(String.self, forKey: .sipURI)
         sipPort      = try c.decodeIfPresent(Int.self, forKey: .sipPort) ?? Int(SIPEndpoint.defaultPort)
         sipTransport = try c.decodeIfPresent(SIPTransportKind.self, forKey: .sipTransport) ?? .udp

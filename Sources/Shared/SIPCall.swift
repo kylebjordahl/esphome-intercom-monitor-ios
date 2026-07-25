@@ -174,8 +174,12 @@ final class SIPCall {
                 guard let self else { return }
                 switch nwState {
                 case .ready:
+                    print("SIPCall: signaling ready \(self.transport.rawValue) " +
+                          "→ \(self.peerHost):\(self.peerPort)")
                     self.sendInitialInvite()
                 case .failed(let error):
+                    print("SIPCall: signaling failed \(self.transport.rawValue) " +
+                          "→ \(self.peerHost):\(self.peerPort) — \(error)")
                     self.state = .failed("SIP transport failed: \(error.localizedDescription)")
                 case .cancelled:
                     break
@@ -310,6 +314,8 @@ final class SIPCall {
     }
 
     private func handleResponse(_ message: SIPMessage, code: Int, reason: String) {
+        print("SIPCall: ← \(code) \(reason) (\(message.cseq?.method ?? "?")) callID=\(callID)")
+
         // Only INVITE responses drive the call state machine; a late 200 to BYE
         // needs no action.
         guard message.cseq?.method == "INVITE" else { return }
@@ -586,14 +592,32 @@ final class SIPCall {
 
     // MARK: - URI helpers
 
-    /// Sanitise a display name into a SIP user part.
+    /// Encode a device name as a SIP user part.
+    ///
+    /// The name is preserved verbatim apart from percent-escaping, because the
+    /// roster addresses panels by their exact name (`sip:Kitchen@192.168.1.51`)
+    /// and VoIP Stack validates the Request-URI.  Lowercasing or substituting
+    /// separators here produced URIs like `sip:poppy_monitor@…` that a panel
+    /// named "Poppy Monitor" has no reason to accept.
+    ///
     /// Nonisolated: roster parsing builds URIs off the main actor.
     nonisolated static func uriUser(_ name: String) -> String {
-        let allowed = name.lowercased().map { ch -> Character in
-            (ch.isLetter || ch.isNumber) ? ch : "_"
+        // RFC 3261 user part: unreserved / escaped / user-unreserved.
+        let unreserved = Set("abcdefghijklmnopqrstuvwxyz" +
+                             "ABCDEFGHIJKLMNOPQRSTUVWXYZ" +
+                             "0123456789" +
+                             "-_.!~*'()" +
+                             "&=+$,;?/")
+        var out = ""
+        for byte in Array(name.utf8) {
+            let scalar = Character(UnicodeScalar(byte))
+            if byte < 0x80, unreserved.contains(scalar) {
+                out.append(scalar)
+            } else {
+                out += String(format: "%%%02X", byte)
+            }
         }
-        let joined = String(allowed).trimmingCharacters(in: CharacterSet(charactersIn: "_"))
-        return joined.isEmpty ? "phone" : joined
+        return out.isEmpty ? "phone" : out
     }
 
     nonisolated static func userPart(_ uri: String) -> String? {
