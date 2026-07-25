@@ -101,11 +101,9 @@ struct SettingsView: View {
         isDiscovering = true
         Task {
             await haClient.fetchAll(baseURL: haURL, token: haToken)
-            // Add any newly discovered devices that aren't already in the store.
-            let existing = Set(deviceStore.devices.map { $0.host })
-            haClient.discoveredDevices
-                .filter { !existing.contains($0.host) }
-                .forEach { deviceStore.add($0) }
+            // Reconcile by identity, not host, so a panel that changed IP is
+            // updated in place rather than duplicated behind a dead entry.
+            haClient.discoveredDevices.forEach { deviceStore.upsertDiscovered($0) }
             session.publishDevicesToWatch(deviceStore.devices)
             isDiscovering = false
         }

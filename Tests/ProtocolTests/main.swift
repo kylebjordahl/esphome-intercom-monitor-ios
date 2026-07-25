@@ -373,6 +373,53 @@ do {
                "a hand-pinned legacy device is not re-armed at the current schema")
 }
 
+// MARK: - Discovery reconciliation
+
+print("\nDeviceStore.upsertDiscovered")
+MainActor.assumeIsolated {
+    // Isolate from any real persisted roster.
+    UserDefaults.standard.removeObject(forKey: IntercomDevice.storageKey)
+    UserDefaults.standard.removeObject(forKey: "saved_devices_schema")
+
+    let store = DeviceStore()
+    let original = IntercomDevice(name: "Poppy Monitor", host: "192.168.2.171",
+                                  protocolKind: .legacy)
+    store.add(original)
+
+    // The panel takes a new DHCP lease. Matching on host (the old behaviour)
+    // could never reconcile this — it duplicated the entry and left calls
+    // pointed at the dead address.
+    let moved = IntercomDevice(name: "Poppy Monitor", host: "192.168.2.180",
+                              protocolKind: .voip, sipPort: 5060, sipTransport: .udp,
+                              txFormats: ["16000:s16le:1:20"], rxFormats: ["16000:s16le:1:20"])
+    store.upsertDiscovered(moved)
+
+    checkEqual(store.devices.count, 1, "a device that changed IP is not duplicated")
+    checkEqual(store.devices.first?.host, "192.168.2.180", "the new address is adopted")
+    checkEqual(store.devices.first?.id, original.id, "the stored id is preserved")
+    checkEqual(store.devices.first?.protocolKind, .voip, "discovery refreshes protocol metadata")
+    checkEqual(store.devices.first?.sipPort, 5060, "discovery refreshes the SIP port")
+
+    // Case/diacritic-insensitive identity matching.
+    store.upsertDiscovered(IntercomDevice(name: "poppy monitor", host: "192.168.2.181",
+                                          protocolKind: .voip))
+    checkEqual(store.devices.count, 1, "name matching ignores case")
+    checkEqual(store.devices.first?.host, "192.168.2.181", "case-insensitive match still updates")
+
+    // A genuinely different panel is added.
+    store.upsertDiscovered(IntercomDevice(name: "Gate", host: "192.168.2.190", protocolKind: .voip))
+    checkEqual(store.devices.count, 2, "a genuinely new device is added")
+
+    // An unchanged re-discovery is a no-op, so we don't churn UserDefaults or
+    // re-donate Siri shortcuts on every poll.
+    let unchanged = store.upsertDiscovered(IntercomDevice(name: "Gate", host: "192.168.2.190",
+                                                          protocolKind: .voip))
+    checkEqual(unchanged, false, "an unchanged rediscovery reports no change")
+
+    UserDefaults.standard.removeObject(forKey: IntercomDevice.storageKey)
+    UserDefaults.standard.removeObject(forKey: "saved_devices_schema")
+}
+
 // MARK: - Legacy→VoIP fallback trigger
 
 print("\nIntercomConnection.isConnectionRefused")

@@ -434,6 +434,55 @@ final class DeviceStore: ObservableObject {
         save()
     }
 
+    /// Reconcile one discovered device into the roster.
+    ///
+    /// Matching is by identity (stable id, else name) and NOT by host, because
+    /// the host is exactly the field that changes: a panel that picks up a new
+    /// DHCP lease would otherwise never match, so the stale entry survived and
+    /// the device was added again as a duplicate. Calls then went to the old
+    /// address and sat on "Connecting…" until the SYN timed out.
+    ///
+    /// The stored `id` is preserved so a live connection, its Live Activity and
+    /// any donated Siri shortcut stay bound to the same entry. Home Assistant is
+    /// authoritative for addressing and protocol metadata, so those are taken
+    /// from the discovered copy.
+    @discardableResult
+    func upsertDiscovered(_ discovered: IntercomDevice) -> Bool {
+        guard let index = devices.firstIndex(where: {
+            $0.id == discovered.id
+                || $0.name.compare(discovered.name, options: [.caseInsensitive, .diacriticInsensitive])
+                    == .orderedSame
+        }) else {
+            devices.append(discovered)
+            save()
+            print("DeviceStore: discovered new device '\(discovered.name)' at \(discovered.host)")
+            return true
+        }
+
+        let existing = devices[index]
+        var updated  = existing
+        updated.host            = discovered.host
+        updated.port            = discovered.port
+        updated.protocolKind    = discovered.protocolKind
+        updated.sipURI          = discovered.sipURI
+        updated.sipPort         = discovered.sipPort
+        updated.sipTransport    = discovered.sipTransport
+        updated.rtpPort         = discovered.rtpPort
+        updated.txFormats       = discovered.txFormats
+        updated.rxFormats       = discovered.rxFormats
+        updated.extensionNumber = discovered.extensionNumber
+
+        guard updated != existing else { return false }
+        if updated.host != existing.host {
+            print("DeviceStore: '\(existing.name)' moved \(existing.host) → \(updated.host)")
+        } else {
+            print("DeviceStore: '\(existing.name)' metadata refreshed from discovery")
+        }
+        devices[index] = updated
+        save()
+        return true
+    }
+
     private func load() {
         let schema = UserDefaults.standard.integer(forKey: schemaKey)   // 0 when never written
         guard let data = UserDefaults.standard.data(forKey: key),
