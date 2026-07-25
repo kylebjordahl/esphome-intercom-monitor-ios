@@ -73,6 +73,11 @@ final class IntercomConnection: ObservableObject, Identifiable {
     /// True while an `.auto` device is still being probed, so a legacy connect
     /// failure switches protocol instead of entering the reconnect backoff.
     private var isProbing: Bool
+    /// Set once a legacy socket has actually come up, so we can tell "this panel
+    /// isn't serving that port" from "an established call dropped".
+    private var hasEverConnected = false
+    /// Latches so the legacy→VoIP fallback can never loop.
+    private var hasTriedVoIP = false
 
     // MARK: - Legacy transport state
 
@@ -166,6 +171,9 @@ final class IntercomConnection: ObservableObject, Identifiable {
 
     private func connectLegacy() {
         state = .connecting
+        print("IntercomConnection: [\(device.name)] legacy connect \(device.host):\(device.port) " +
+              "(protocol=\(device.protocolKind.rawValue) probing=\(isProbing) " +
+              "sip=\(device.host):\(device.sipPort)/\(device.sipTransport.rawValue))")
 
         let tcpOpts = NWProtocolTCP.Options()
         tcpOpts.enableKeepalive = true
@@ -440,6 +448,7 @@ final class IntercomConnection: ObservableObject, Identifiable {
         case .ready:
             // A legacy panel answered on 6054 — the probe is settled.
             isProbing = false
+            hasEverConnected = true
             reconnectAttempt = 0
             state = .idle
             startPingTimer()
@@ -447,11 +456,7 @@ final class IntercomConnection: ObservableObject, Identifiable {
 
         case .failed(let err):
             print("IntercomConnection: [\(device.name)] NWConnection failed — \(err)")
-            if isProbing, !isServerSide {
-                switchToVoIPAfterProbe()
-                return
-            }
-            handleUnexpectedDrop()
+            handleUnexpectedDrop(error: err)
 
         case .cancelled:
             // Only force the terminal state here for a deliberate disconnect().
@@ -466,9 +471,19 @@ final class IntercomConnection: ObservableObject, Identifiable {
 
     /// The legacy port refused us, so this panel is running firmware that
     /// retired the PBX-lite protocol.  Retry the same device over SIP.
+    /// True only for an explicit "connection refused" (RST), which means the
+    /// host is up and nothing is bound to that port — as opposed to a timeout or
+    /// unreachable host, which mean the panel itself is absent.
+    nonisolated static func isConnectionRefused(_ error: NWError?) -> Bool {
+        guard let error else { return false }
+        if case .posix(let code) = error { return code == .ECONNREFUSED }
+        return false
+    }
+
     private func switchToVoIPAfterProbe() {
-        isProbing = false
-        mode      = .voip
+        isProbing    = false
+        hasTriedVoIP = true
+        mode         = .voip
         nwConn?.cancel()
         nwConn = nil
         receiveBuffer.removeAll()
@@ -484,13 +499,28 @@ final class IntercomConnection: ObservableObject, Identifiable {
     /// connection with backoff instead of just giving up.  Only meaningful
     /// client-side: a server-side connection can't dial the remote panel back,
     /// so it just has to wait for the panel to redial us.
-    private func handleUnexpectedDrop() {
+    private func handleUnexpectedDrop(error: NWError? = nil) {
         // A refused connection surfaces through the receive completion handler
-        // *before* NWConnection reports .failed, so the probe decision has to be
-        // made here too.  Without this an .auto device burns all five reconnect
-        // attempts against a legacy port that no longer exists, then gives up —
-        // which is exactly what a v2026.7.0+ panel does to a legacy connect.
-        if isProbing, !isServerSide {
+        // *before* NWConnection reports .failed, so the fallback decision has to
+        // be made here too, or the connection just enters the reconnect backoff.
+        //
+        // ECONNREFUSED on a socket that never came up is unambiguous: the panel
+        // is reachable and actively rejected the port, so nothing is serving the
+        // legacy protocol there.  Retrying it five times cannot help.  We fall
+        // forward to SIP on that signal REGARDLESS of the stored protocolKind —
+        // a stale `.legacy` value (from an older build, an App Intents round
+        // trip, or a hand pin made before the panel was upgraded) must not be
+        // able to strand the connection.  A panel that is merely offline fails
+        // with a timeout rather than a refusal, so legacy reconnect/backoff is
+        // preserved for that case.
+        let refused = Self.isConnectionRefused(error)
+        if !isServerSide, mode == .legacy, !hasTriedVoIP, !hasEverConnected,
+           isProbing || refused {
+            if refused, !isProbing {
+                print("IntercomConnection: [\(device.name)] legacy port \(device.port) " +
+                      "actively refused though protocol is '\(device.protocolKind.rawValue)' — " +
+                      "treating as VoIP firmware")
+            }
             switchToVoIPAfterProbe()
             return
         }
@@ -540,7 +570,7 @@ final class IntercomConnection: ObservableObject, Identifiable {
                 }
                 if done || err != nil {
                     print("IntercomConnection: [\(self.device.name)] socket closed — done=\(done) err=\(err.map { "\($0)" } ?? "nil") state=\(self.state)")
-                    self.handleUnexpectedDrop()
+                    self.handleUnexpectedDrop(error: err)
                 } else {
                     self.receive()
                 }

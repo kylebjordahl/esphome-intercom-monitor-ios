@@ -373,6 +373,27 @@ do {
                "a hand-pinned legacy device is not re-armed at the current schema")
 }
 
+// MARK: - Legacy→VoIP fallback trigger
+
+print("\nIntercomConnection.isConnectionRefused")
+do {
+    // ECONNREFUSED means the host is up and nothing is bound to that port, so
+    // the panel is running firmware that dropped the legacy protocol. This is
+    // the signal that must override a stale stored protocolKind.
+    check(IntercomConnection.isConnectionRefused(.posix(.ECONNREFUSED)),
+          "connection refused is recognised")
+    // These mean the panel itself is absent, so legacy reconnect/backoff should
+    // still apply rather than switching protocol.
+    check(!IntercomConnection.isConnectionRefused(.posix(.ETIMEDOUT)),
+          "timeout is not treated as a protocol signal")
+    check(!IntercomConnection.isConnectionRefused(.posix(.EHOSTUNREACH)),
+          "unreachable host is not treated as a protocol signal")
+    check(!IntercomConnection.isConnectionRefused(.posix(.ENETDOWN)),
+          "network down is not treated as a protocol signal")
+    check(!IntercomConnection.isConnectionRefused(nil),
+          "a clean close is not treated as a protocol signal")
+}
+
 // MARK: - SIP URI user part
 
 print("\nSIPCall.uriUser")
