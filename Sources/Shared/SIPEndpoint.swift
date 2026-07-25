@@ -227,6 +227,23 @@ final class SIPEndpoint: ObservableObject {
     }
 
     private func receiveLoop(on connection: NWConnection, transport: SIPTransportKind) {
+        // Same hazard as SIPCall: on UDP every datagram sets `isComplete`, so a
+        // stream-style receive loop would cancel the connection after the first
+        // inbound message and miss every follow-up (an ACK, a BYE, a re-INVITE).
+        guard transport == .tcp else {
+            connection.receiveMessage { [weak self] data, _, _, error in
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    if let data, !data.isEmpty, let message = SIPMessage.decode(data) {
+                        self.route(message, from: connection, transport: .udp)
+                    }
+                    if error != nil { connection.cancel(); return }
+                    self.receiveLoop(on: connection, transport: .udp)
+                }
+            }
+            return
+        }
+
         connection.receive(minimumIncompleteLength: 1, maximumLength: 65_536) {
             [weak self] data, _, isComplete, error in
             Task { @MainActor [weak self] in

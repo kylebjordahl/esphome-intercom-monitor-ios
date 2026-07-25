@@ -560,24 +560,54 @@ final class SIPCall {
     // MARK: - Receiving on our own signaling socket
 
     private func receiveLoop(on connection: NWConnection) {
+        switch transport {
+        case .udp:  receiveDatagram(on: connection)
+        case .tcp:  receiveStream(on: connection)
+        }
+    }
+
+    /// UDP: one datagram is exactly one SIP message.
+    ///
+    /// This MUST use `receiveMessage` and re-arm unconditionally.  With the
+    /// stream-oriented `receive`, every datagram sets `isComplete` — a UDP
+    /// "message" is complete as soon as it arrives — so treating that as
+    /// end-of-stream tore the loop down after the very first response.  The
+    /// symptom was a call that logged `100 Trying` and then went permanently
+    /// deaf: the `180 Ringing` and `200 OK` were delivered but never read, so
+    /// the call sat in `.calling` until the user gave up and hung up.
+    private func receiveDatagram(on connection: NWConnection) {
+        connection.receiveMessage { [weak self] data, _, _, error in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                if let data, !data.isEmpty, let message = SIPMessage.decode(data) {
+                    self.handle(message, from: connection)
+                }
+                // Only a real transport error stops the loop; a completed
+                // datagram is the normal case, not a reason to stop listening.
+                if let error {
+                    print("SIPCall: UDP signaling error — \(error)")
+                    if case .active = self.state { self.state = .ended("signaling closed") }
+                    return
+                }
+                guard self.signaling === connection else { return }   // superseded/torn down
+                self.receiveDatagram(on: connection)
+            }
+        }
+    }
+
+    /// TCP: a byte stream that may split or coalesce messages, so buffer and
+    /// frame by Content-Length.  Here `isComplete` genuinely means FIN.
+    private func receiveStream(on connection: NWConnection) {
         connection.receive(minimumIncompleteLength: 1, maximumLength: 65_536) {
             [weak self] data, _, isComplete, error in
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 if let data, !data.isEmpty {
-                    switch self.transport {
-                    case .udp:
-                        // One datagram is exactly one SIP message.
-                        if let message = SIPMessage.decode(data) {
+                    self.signalingBuffer.append(data)
+                    while let framed = SIPMessage.frame(from: self.signalingBuffer) {
+                        self.signalingBuffer = framed.remaining
+                        if let message = SIPMessage.decode(framed.message) {
                             self.handle(message, from: connection)
-                        }
-                    case .tcp:
-                        self.signalingBuffer.append(data)
-                        while let framed = SIPMessage.frame(from: self.signalingBuffer) {
-                            self.signalingBuffer = framed.remaining
-                            if let message = SIPMessage.decode(framed.message) {
-                                self.handle(message, from: connection)
-                            }
                         }
                     }
                 }
@@ -587,7 +617,8 @@ final class SIPCall {
                     }
                     return
                 }
-                self.receiveLoop(on: connection)
+                guard self.signaling === connection else { return }
+                self.receiveStream(on: connection)
             }
         }
     }
