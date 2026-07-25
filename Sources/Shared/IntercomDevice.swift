@@ -168,7 +168,11 @@ struct IntercomDevice: Identifiable, Codable, Hashable, Sendable {
     static func fromRosterEntry(_ raw: [String: Any]) -> IntercomDevice? {
         guard let name = (raw["name"] as? String)?.trimmingCharacters(in: .whitespaces),
               !name.isEmpty
-        else { return nil }
+        else {
+            print("IntercomDevice: roster entry skipped — no name (keys: " +
+                  "\(raw.keys.sorted().joined(separator: ",")))")
+            return nil
+        }
 
         // A roster row that HA hasn't been given an explicit URI for carries
         // `"sip_uri": ""` rather than omitting the key.  Normalise that to nil —
@@ -181,7 +185,10 @@ struct IntercomDevice: Identifiable, Codable, Hashable, Sendable {
             .nilIfEmpty
 
         // Entries can be disabled in HA without being removed from the roster.
-        if let enabled = raw["enabled"] as? Bool, !enabled { return nil }
+        if let enabled = raw["enabled"] as? Bool, !enabled {
+            print("IntercomDevice: roster entry '\(name)' skipped — disabled in HA")
+            return nil
+        }
 
         // Host: prefer the explicit address, else the host part of the SIP URI.
         var host = (raw["address"] as? String)?.trimmingCharacters(in: .whitespaces) ?? ""
@@ -190,7 +197,11 @@ struct IntercomDevice: Identifiable, Codable, Hashable, Sendable {
         let isBridge = (raw["ha_bridge"] as? Bool) ?? false
         // A name-only or group entry has to be dialled through HA; this client
         // only places direct calls, so it is not a usable roster device.
-        guard !host.isEmpty, !(isBridge && sipURI == nil) else { return nil }
+        guard !host.isEmpty, !(isBridge && sipURI == nil) else {
+            let reason = host.isEmpty ? "no address or sip_uri" : "HA-routed group/bridge entry"
+            print("IntercomDevice: roster entry '\(name)' skipped — \(reason)")
+            return nil
+        }
 
         // Transport may appear under either key; `sip_transport` wins.
         let transport = SIPTransportKind(token: metadata["sip_transport"] as? String)

@@ -142,9 +142,26 @@ final class HomeAssistantClient: ObservableObject {
     }
 
     private func parseVoipRoster(_ attributes: [String: Any]) -> [IntercomDevice] {
+        // This layer has silently produced an empty list more than once, so say
+        // what was actually received before deciding anything.
+        let shapes = attributes.keys.sorted().map { key -> String in
+            let value = attributes[key]
+            let kind: String
+            switch value {
+            case let string as String: kind = "string(\(string.count))"
+            case is [Any]:             kind = "array"
+            case is [String: Any]:     kind = "object"
+            case is Int:               kind = "int"
+            default:                   kind = "other"
+            }
+            return "\(key):\(kind)"
+        }
+        print("HomeAssistantClient: voip_phonebook attributes — \(shapes.joined(separator: " "))")
+
         // 1 — canonical JSON document.
         if let raw = attributes["roster_json"] as? String, !raw.isEmpty {
             let parsed = IntercomDevice.fromRosterJSON(raw)
+            print("HomeAssistantClient: roster_json string → \(parsed.count) device(s)")
             if !parsed.isEmpty { return parsed }
         }
         // Some HA versions hand back already-decoded JSON rather than a string.
@@ -161,8 +178,12 @@ final class HomeAssistantClient: ObservableObject {
         }
         // 2 — compact ESP phonebook string.
         if let raw = attributes["phonebook"] as? String, !raw.isEmpty {
-            return parsePhonebook(raw)
+            let parsed = parsePhonebook(raw)
+            print("HomeAssistantClient: compact phonebook (\(raw.count) chars) → " +
+                  "\(parsed.count) device(s)")
+            return parsed
         }
+        print("HomeAssistantClient: no usable roster attribute found")
         return []
     }
 
