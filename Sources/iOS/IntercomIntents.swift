@@ -56,7 +56,15 @@ struct IntercomDeviceEntity: AppEntity {
 
     var displayRepresentation: DisplayRepresentation { DisplayRepresentation(title: "\(name)") }
 
-    var device: IntercomDevice { IntercomDevice(id: id, name: name, host: host, port: port) }
+    /// Re-read the full device from the persisted roster rather than rebuilding
+    /// it from this entity's four fields.  An AppEntity only needs enough to
+    /// identify and display a panel, but a *call* needs the VoIP metadata too
+    /// (protocol, SIP port/transport/URI) — reconstructing from id/name/host/
+    /// port alone silently dropped all of it and dialled with defaults.
+    var device: IntercomDevice {
+        IntercomDevice.loadSaved().first { $0.id == id }
+            ?? IntercomDevice(id: id, name: name, host: host, port: port)
+    }
 
     init(_ device: IntercomDevice) {
         id = device.id; name = device.name; host = device.host; port = device.port

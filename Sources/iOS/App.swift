@@ -72,13 +72,13 @@ struct IntercomListenerApp: App {
         }
     }
 
-    /// Merge any newly-discovered devices into the store without removing
-    /// existing ones (matched by host so a live call's device is never dropped).
+    /// Merge discovered devices into the store without removing existing ones.
+    ///
+    /// Reconciles by identity rather than host, so a panel that changes IP has
+    /// its address updated in place instead of being added again alongside a
+    /// stale entry that no longer answers.
     @MainActor
     private func mergeDiscovered() {
-        let existing = Set(deviceStore.devices.map { $0.host })
-        haClient.discoveredDevices
-            .filter { !existing.contains($0.host) }
-            .forEach { deviceStore.add($0) }
+        haClient.discoveredDevices.forEach { deviceStore.upsertDiscovered($0) }
     }
 }

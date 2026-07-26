@@ -112,7 +112,9 @@ final class SIPCall {
 
         let contactPort = endpoint.localPort
         self.localURI     = "sip:\(Self.uriUser(callerName))@\(endpoint.localAddress):\(contactPort)"
-        self.remoteURI    = device.sipURI
+        // Belt and braces: the roster commonly carries an empty `sip_uri`, and a
+        // blank Request-URI would produce a malformed INVITE.
+        self.remoteURI = device.sipURI?.trimmingCharacters(in: .whitespaces).nilIfEmpty
             ?? "sip:\(Self.uriUser(device.name))@\(device.host):\(device.sipPort)"
         self.remoteTarget = self.remoteURI
     }
@@ -174,8 +176,12 @@ final class SIPCall {
                 guard let self else { return }
                 switch nwState {
                 case .ready:
+                    print("SIPCall: signaling ready \(self.transport.rawValue) " +
+                          "→ \(self.peerHost):\(self.peerPort)")
                     self.sendInitialInvite()
                 case .failed(let error):
+                    print("SIPCall: signaling failed \(self.transport.rawValue) " +
+                          "→ \(self.peerHost):\(self.peerPort) — \(error)")
                     self.state = .failed("SIP transport failed: \(error.localizedDescription)")
                 case .cancelled:
                     break
@@ -310,6 +316,8 @@ final class SIPCall {
     }
 
     private func handleResponse(_ message: SIPMessage, code: Int, reason: String) {
+        print("SIPCall: ← \(code) \(reason) (\(message.cseq?.method ?? "?")) callID=\(callID)")
+
         // Only INVITE responses drive the call state machine; a late 200 to BYE
         // needs no action.
         guard message.cseq?.method == "INVITE" else { return }
@@ -552,24 +560,54 @@ final class SIPCall {
     // MARK: - Receiving on our own signaling socket
 
     private func receiveLoop(on connection: NWConnection) {
+        switch transport {
+        case .udp:  receiveDatagram(on: connection)
+        case .tcp:  receiveStream(on: connection)
+        }
+    }
+
+    /// UDP: one datagram is exactly one SIP message.
+    ///
+    /// This MUST use `receiveMessage` and re-arm unconditionally.  With the
+    /// stream-oriented `receive`, every datagram sets `isComplete` — a UDP
+    /// "message" is complete as soon as it arrives — so treating that as
+    /// end-of-stream tore the loop down after the very first response.  The
+    /// symptom was a call that logged `100 Trying` and then went permanently
+    /// deaf: the `180 Ringing` and `200 OK` were delivered but never read, so
+    /// the call sat in `.calling` until the user gave up and hung up.
+    private func receiveDatagram(on connection: NWConnection) {
+        connection.receiveMessage { [weak self] data, _, _, error in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                if let data, !data.isEmpty, let message = SIPMessage.decode(data) {
+                    self.handle(message, from: connection)
+                }
+                // Only a real transport error stops the loop; a completed
+                // datagram is the normal case, not a reason to stop listening.
+                if let error {
+                    print("SIPCall: UDP signaling error — \(error)")
+                    if case .active = self.state { self.state = .ended("signaling closed") }
+                    return
+                }
+                guard self.signaling === connection else { return }   // superseded/torn down
+                self.receiveDatagram(on: connection)
+            }
+        }
+    }
+
+    /// TCP: a byte stream that may split or coalesce messages, so buffer and
+    /// frame by Content-Length.  Here `isComplete` genuinely means FIN.
+    private func receiveStream(on connection: NWConnection) {
         connection.receive(minimumIncompleteLength: 1, maximumLength: 65_536) {
             [weak self] data, _, isComplete, error in
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 if let data, !data.isEmpty {
-                    switch self.transport {
-                    case .udp:
-                        // One datagram is exactly one SIP message.
-                        if let message = SIPMessage.decode(data) {
+                    self.signalingBuffer.append(data)
+                    while let framed = SIPMessage.frame(from: self.signalingBuffer) {
+                        self.signalingBuffer = framed.remaining
+                        if let message = SIPMessage.decode(framed.message) {
                             self.handle(message, from: connection)
-                        }
-                    case .tcp:
-                        self.signalingBuffer.append(data)
-                        while let framed = SIPMessage.frame(from: self.signalingBuffer) {
-                            self.signalingBuffer = framed.remaining
-                            if let message = SIPMessage.decode(framed.message) {
-                                self.handle(message, from: connection)
-                            }
                         }
                     }
                 }
@@ -579,21 +617,40 @@ final class SIPCall {
                     }
                     return
                 }
-                self.receiveLoop(on: connection)
+                guard self.signaling === connection else { return }
+                self.receiveStream(on: connection)
             }
         }
     }
 
     // MARK: - URI helpers
 
-    /// Sanitise a display name into a SIP user part.
+    /// Encode a device name as a SIP user part.
+    ///
+    /// The name is preserved verbatim apart from percent-escaping, because the
+    /// roster addresses panels by their exact name (`sip:Kitchen@192.168.1.51`)
+    /// and VoIP Stack validates the Request-URI.  Lowercasing or substituting
+    /// separators here produced URIs like `sip:poppy_monitor@…` that a panel
+    /// named "Poppy Monitor" has no reason to accept.
+    ///
     /// Nonisolated: roster parsing builds URIs off the main actor.
     nonisolated static func uriUser(_ name: String) -> String {
-        let allowed = name.lowercased().map { ch -> Character in
-            (ch.isLetter || ch.isNumber) ? ch : "_"
+        // RFC 3261 user part: unreserved / escaped / user-unreserved.
+        let unreserved = Set("abcdefghijklmnopqrstuvwxyz" +
+                             "ABCDEFGHIJKLMNOPQRSTUVWXYZ" +
+                             "0123456789" +
+                             "-_.!~*'()" +
+                             "&=+$,;?/")
+        var out = ""
+        for byte in Array(name.utf8) {
+            let scalar = Character(UnicodeScalar(byte))
+            if byte < 0x80, unreserved.contains(scalar) {
+                out.append(scalar)
+            } else {
+                out += String(format: "%%%02X", byte)
+            }
         }
-        let joined = String(allowed).trimmingCharacters(in: CharacterSet(charactersIn: "_"))
-        return joined.isEmpty ? "phone" : joined
+        return out.isEmpty ? "phone" : out
     }
 
     nonisolated static func userPart(_ uri: String) -> String? {

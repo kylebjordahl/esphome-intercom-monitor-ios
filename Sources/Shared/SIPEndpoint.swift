@@ -53,6 +53,11 @@ final class SIPEndpoint: ObservableObject {
     /// Delivered for an INVITE that doesn't match an existing dialog.
     var onIncomingCall: ((SIPCall) -> Void)?
 
+    /// Fired once the real listening port is known.  The endpoint may not get
+    /// the conventional 5060, and whatever it does get has to be re-advertised
+    /// to Home Assistant or peers will call a port nothing is listening on.
+    var onListeningChanged: (() -> Void)?
+
     private var udpListener: NWListener?
     private var tcpListener: NWListener?
     private var calls: [String: SIPCall] = [:]
@@ -90,12 +95,61 @@ final class SIPEndpoint: ObservableObject {
         self.localName    = localName
         self.localAddress = address
         self.localPort    = port
+        startUDP(preferred: port)
+    }
 
-        udpListener = makeListener(parameters: .udp, port: port, label: "UDP")
+    /// UDP is the contract-critical listener: we advertise `sip_udp`, and RTP is
+    /// UDP regardless of signaling transport.  5060 is only a convention — if
+    /// something else on the device already holds it we take an ephemeral port
+    /// and advertise that instead, rather than ending up with no SIP presence
+    /// at all.  The bound port is what goes into Via, Contact and the roster.
+    private func startUDP(preferred: UInt16) {
+        udpListener = makeListener(
+            parameters: .udp,
+            port: preferred,
+            label: "UDP",
+            onReady: { [weak self] boundPort in
+                guard let self else { return }
+                self.localPort   = boundPort
+                self.isListening = true
+                self.error       = nil
+                print("SIPEndpoint: listening UDP on \(self.localAddress):\(boundPort)")
+                self.startTCP(port: boundPort)
+                self.onListeningChanged?()
+            },
+            onFailure: { [weak self] reason in
+                guard let self else { return }
+                guard preferred != 0 else {
+                    self.error = "SIP UDP listener failed: \(reason)"
+                    print("SIPEndpoint: UDP listener failed on an ephemeral port — \(reason)")
+                    return
+                }
+                print("SIPEndpoint: UDP port \(preferred) unavailable (\(reason)) — " +
+                      "retrying on an ephemeral port")
+                self.udpListener?.cancel()
+                self.udpListener = nil
+                self.startUDP(preferred: 0)          // 0 == NWEndpoint.Port.any
+            })
+    }
+
+    /// TCP signaling is best-effort: a peer that wants it can use it, but we
+    /// advertise UDP, so failing to bind here is not fatal to the endpoint.
+    private func startTCP(port: UInt16) {
         let tcpOpts = NWProtocolTCP.Options()
         tcpOpts.enableKeepalive = true
-        tcpListener = makeListener(parameters: NWParameters(tls: nil, tcp: tcpOpts),
-                                   port: port, label: "TCP")
+        tcpListener = makeListener(
+            parameters: NWParameters(tls: nil, tcp: tcpOpts),
+            port: port,
+            label: "TCP",
+            onReady: { [weak self] boundPort in
+                guard let self else { return }
+                print("SIPEndpoint: listening TCP on \(self.localAddress):\(boundPort)")
+            },
+            onFailure: { [weak self] reason in
+                self?.tcpListener?.cancel()
+                self?.tcpListener = nil
+                print("SIPEndpoint: TCP listener unavailable — \(reason) (continuing UDP-only)")
+            })
     }
 
     func stop() {
@@ -109,22 +163,23 @@ final class SIPEndpoint: ObservableObject {
 
     private func makeListener(parameters: NWParameters,
                               port: UInt16,
-                              label: String) -> NWListener? {
+                              label: String,
+                              onReady: @escaping (UInt16) -> Void,
+                              onFailure: @escaping (String) -> Void) -> NWListener? {
         parameters.allowLocalEndpointReuse = true
         do {
             let listener = try NWListener(using: parameters,
                                           on: NWEndpoint.Port(rawValue: port) ?? .any)
-            listener.stateUpdateHandler = { [weak self] state in
+            listener.stateUpdateHandler = { [weak self, weak listener] state in
                 Task { @MainActor [weak self] in
-                    guard let self else { return }
+                    guard self != nil else { return }
                     switch state {
                     case .ready:
-                        self.isListening = true
-                        self.error = nil
-                        print("SIPEndpoint: listening \(label) on \(self.localAddress):\(port)")
+                        // With an ephemeral request the real port is only known
+                        // once the listener is up — read it back, never assume.
+                        onReady(listener?.port?.rawValue ?? port)
                     case .failed(let err):
-                        self.error = err.localizedDescription
-                        print("SIPEndpoint: \(label) listener failed — \(err)")
+                        onFailure(err.localizedDescription)
                     default:
                         break
                     }
@@ -172,6 +227,23 @@ final class SIPEndpoint: ObservableObject {
     }
 
     private func receiveLoop(on connection: NWConnection, transport: SIPTransportKind) {
+        // Same hazard as SIPCall: on UDP every datagram sets `isComplete`, so a
+        // stream-style receive loop would cancel the connection after the first
+        // inbound message and miss every follow-up (an ACK, a BYE, a re-INVITE).
+        guard transport == .tcp else {
+            connection.receiveMessage { [weak self] data, _, _, error in
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    if let data, !data.isEmpty, let message = SIPMessage.decode(data) {
+                        self.route(message, from: connection, transport: .udp)
+                    }
+                    if error != nil { connection.cancel(); return }
+                    self.receiveLoop(on: connection, transport: .udp)
+                }
+            }
+            return
+        }
+
         connection.receive(minimumIncompleteLength: 1, maximumLength: 65_536) {
             [weak self] data, _, isComplete, error in
             Task { @MainActor [weak self] in

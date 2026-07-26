@@ -333,7 +333,9 @@ do {
     """
     let decoded = try JSONDecoder().decode([IntercomDevice].self, from: Data(oldJSON.utf8))
     checkEqual(decoded.count, 1, "decodes a pre-upgrade saved roster")
-    checkEqual(decoded.first?.protocolKind, .legacy, "pre-upgrade devices default to legacy")
+    // Must be .auto, not .legacy: a panel saved before this update may since have
+    // been upgraded past v2026.7.0, and .legacy would strand it permanently.
+    checkEqual(decoded.first?.protocolKind, .auto, "pre-upgrade devices probe rather than assume legacy")
     checkEqual(decoded.first?.sipPort, 5060, "pre-upgrade devices get a default SIP port")
 
     // And the new shape must survive a save/load cycle.
@@ -341,6 +343,303 @@ do {
     let reloaded  = try JSONDecoder().decode([IntercomDevice].self, from: reencoded)
     checkEqual(reloaded.first?.protocolKind, .voip, "voip devices persist their protocol")
     checkEqual(reloaded.first?.sipTransport, .tcp, "voip devices persist their transport")
+}
+
+// MARK: - Persisted-store migration
+
+print("\nDeviceStore.migrate")
+do {
+    // The pre-fix build wrote protocolKind explicitly on every save, so simply
+    // changing the decode default could not reach devices already on disk.
+    let stored = [
+        IntercomDevice(name: "Poppy Monitor", host: "192.168.2.171", protocolKind: .legacy),
+        IntercomDevice(name: "Salotto", host: "192.168.1.52", protocolKind: .voip),
+        IntercomDevice(name: "Manual", host: "192.168.1.99", protocolKind: .auto),
+    ]
+
+    let migrated = DeviceStore.migrate(stored, fromSchema: 0)
+    checkEqual(migrated[0].protocolKind, .auto, "legacy-pinned device is re-armed for probing")
+    checkEqual(migrated[1].protocolKind, .voip, "voip devices are left alone")
+    checkEqual(migrated[2].protocolKind, .auto, "auto devices are left alone")
+    checkEqual(migrated.count, stored.count, "migration preserves the roster")
+    checkEqual(migrated[0].host, "192.168.2.171", "migration preserves addressing")
+
+    // Schema 1 is the pre-fix build; it needs the same treatment.
+    checkEqual(DeviceStore.migrate(stored, fromSchema: 1)[0].protocolKind, .auto,
+               "schema 1 stores are migrated too")
+
+    // Once migrated, a deliberate user choice must survive.
+    checkEqual(DeviceStore.migrate(stored, fromSchema: 2)[0].protocolKind, .legacy,
+               "a hand-pinned legacy device is not re-armed at the current schema")
+}
+
+// MARK: - voip_phonebook attribute shapes
+
+print("\nsensor.voip_phonebook parsing")
+MainActor.assumeIsolated {
+    let client = HomeAssistantClient()
+
+    // Exactly what VoipPhonebookSensor.extra_state_attributes publishes:
+    // roster_json is the canonical document, phonebook is the compact ESP
+    // string built by format_entry_unified() and joined with ",".
+    let rosterJSON = """
+    {"version":2,"capabilities":["extension","ring_group"],"contacts":[
+      {"id":"poppy","name":"Poppy Monitor","address":"192.168.2.180",
+       "sip_uri":"sip:Poppy Monitor@192.168.2.180:5060","extension":"201","port":5060,
+       "metadata":{"sip_transport":"udp","sip_port":5060,"rtp_port":40000,
+                   "tx_format":"16000:s16le:1:20","rx_format":"16000:s16le:1:20"}},
+      {"id":"allrooms","name":"AllRooms","address":"","sip_uri":"","ha_bridge":true,
+       "metadata":{"group_type":"ring","members":["Poppy Monitor"]}}
+    ]}
+    """
+    let fromJSON = client.parseVoipRosterForTesting(["roster_json": rosterJSON,
+                                                     "phonebook": "",
+                                                     "count": 2])
+    checkEqual(fromJSON.count, 1, "roster_json is read and the group entry skipped")
+    checkEqual(fromJSON.first?.name, "Poppy Monitor", "roster_json entry name")
+    checkEqual(fromJSON.first?.host, "192.168.2.180", "roster_json entry address")
+    checkEqual(fromJSON.first?.protocolKind, .voip, "roster_json entries are voip")
+
+    // The compact fallback. Note this row has 8 fields — no trailing extension,
+    // unlike the per-device endpoint sensor.
+    let compact = "Poppy Monitor|192.168.2.180|5060|40000|full_duplex|" +
+                  "16000:s16le:1:20;16000:s16le:1:32|16000:s16le:1:20|sip_udp"
+    let fromCompact = client.parseVoipRosterForTesting(["phonebook": compact, "count": 1])
+    checkEqual(fromCompact.count, 1, "falls back to the compact phonebook string")
+    checkEqual(fromCompact.first?.host, "192.168.2.180", "compact row address")
+    checkEqual(fromCompact.first?.sipPort, 5060, "compact row SIP port")
+    checkEqual(fromCompact.first?.sipTransport, .udp, "compact row transport")
+    checkEqual(fromCompact.first?.protocolKind, .voip, "compact rows are voip")
+
+    // Several rows, comma-joined, including a bare-name peer that has no direct
+    // address (format_entry_unified returns just the name for those).
+    let multi = "\(compact),AllRooms,Gate|192.168.2.190|5060|40000|full_duplex|" +
+                "16000:s16le:1:20|16000:s16le:1:20|sip_tcp"
+    let fromMulti = client.parseVoipRosterForTesting(["phonebook": multi, "count": 3])
+    checkEqual(fromMulti.count, 2, "bare-name rows are skipped, addressable rows kept")
+    checkEqual(fromMulti.last?.sipTransport, .tcp, "sip_tcp row parses as TCP")
+
+    // A mixed-generation house: legacy and voip rows in one string.
+    let mixed = "OldPanel|tcp|192.168.2.50|6054,\(compact)"
+    let fromMixed = client.parseVoipRosterForTesting(["phonebook": mixed, "count": 2])
+    checkEqual(fromMixed.count, 2, "mixed legacy + voip rows both parse")
+    checkEqual(fromMixed.first?.protocolKind, .legacy, "legacy row keeps the legacy protocol")
+    checkEqual(fromMixed.last?.protocolKind, .voip, "voip row keeps the voip protocol")
+
+    // roster_json wins when both are present and usable.
+    let both = client.parseVoipRosterForTesting(["roster_json": rosterJSON,
+                                                 "phonebook": compact, "count": 2])
+    checkEqual(both.first?.extensionNumber, "201",
+               "roster_json is preferred over the compact string")
+
+    // Already-decoded JSON, which some HA versions hand back instead of a string.
+    let decoded: [String: Any] = ["roster_json": ["version": 2, "contacts": [
+        ["id": "gate", "name": "Gate", "address": "192.168.2.190",
+         "metadata": ["sip_transport": "udp", "sip_port": 5060]]
+    ]]]
+    checkEqual(client.parseVoipRosterForTesting(decoded).first?.name, "Gate",
+               "pre-decoded roster_json is handled")
+
+    checkEqual(client.parseVoipRosterForTesting(["phonebook": "", "count": 0]).count, 0,
+               "an empty roster yields nothing")
+}
+
+// MARK: - Real roster captured from a live v2026.8.0 install
+
+print("\nLive roster fixture")
+MainActor.assumeIsolated {
+    let client = HomeAssistantClient()
+
+    // Verbatim from Developer Tools → States → sensor.voip_phonebook.
+    let liveRosterJSON = """
+    {"capabilities":["extension","ring_group","conference_group","conference_ring"],"contacts":[{"address":"192.168.7.173","enabled":true,"extension":"","ha_bridge":false,"id":"Poppy Monitor","metadata":{"audio_mode":"full_duplex","capabilities":["audio","dtmf"],"conference_group":"CG Casa","conference_ring":false,"device_id":"3484e3d6649858fab912c870f3e91de4","endpoint_id":"esphome:3484e3d6649858fab912c870f3e91de4","endpoint_kind":"esphome","local_ha":false,"ring_group":"RG Casa","rtp_port":40000,"rx_formats":["48000:s16le:1:10","32000:s16le:1:16","16000:s16le:1:10","16000:s16le:1:16","16000:s16le:1:32"],"sip_port":5060,"sip_transport":"udp","tx_formats":["16000:s16le:1:16","16000:s16le:1:10"]},"name":"Poppy Monitor","number":"","port":5060,"sip_uri":""},{"address":"192.168.7.148","enabled":true,"extension":"","ha_bridge":false,"id":"Patton Mannor","metadata":{"audio_mode":"full_duplex","capabilities":["audio","dtmf"],"conference_group":"","conference_ring":false,"device_id":"0aebd073ca623fa256a9c68b3e0b02c2","endpoint_id":"default","endpoint_kind":"browser","local_ha":true,"ring_group":"","rtp_port":40000,"rx_formats":["48000:s16le:2:20","48000:s16le:1:20","48000:s16le:1:10","32000:s16le:1:16","32000:s16le:1:10","16000:s16le:1:16","16000:s16le:1:10","16000:s16le:1:20"],"sip_port":5060,"sip_transport":"tcp","tx_formats":["48000:s16le:2:20","48000:s16le:1:20","48000:s16le:1:10","32000:s16le:1:16","32000:s16le:1:10","16000:s16le:1:16","16000:s16le:1:10","16000:s16le:1:20"]},"name":"Patton Mannor","number":"","port":5060,"sip_uri":""},{"address":"","enabled":true,"extension":"","ha_bridge":true,"id":"CG Casa","metadata":{"auto":true,"group_type":"conference","members":["Poppy Monitor"],"ring_members":[]},"name":"CG Casa","number":"","port":0,"sip_uri":""},{"address":"","enabled":true,"extension":"","ha_bridge":true,"id":"RG Casa","metadata":{"auto":true,"group_type":"ring","members":["Poppy Monitor"],"ring_members":[]},"name":"RG Casa","number":"","port":0,"sip_uri":""}],"version":2}
+    """
+
+    let devices = client.parseVoipRosterForTesting(["roster_json": liveRosterJSON, "count": 4])
+    // Four contacts: one ESP panel, one HA browser softphone, two HA groups.
+    // Only the ESP panel is an intercom this app should list.
+    checkEqual(devices.count, 1, "only the ESP panel is listed")
+
+    guard let poppy = devices.first(where: { $0.name == "Poppy Monitor" }) else {
+        check(false, "Poppy Monitor is discovered"); exit(1)
+    }
+    checkEqual(poppy.host, "192.168.7.173", "ESP address")
+    checkEqual(poppy.sipPort, 5060, "ESP SIP port from metadata")
+    checkEqual(poppy.sipTransport, .udp, "ESP SIP transport from metadata")
+    checkEqual(poppy.rtpPort, 40_000, "ESP RTP port from metadata")
+    checkEqual(poppy.protocolKind, .voip, "ESP entry is voip")
+    // The roster carries formats as JSON arrays under the *plural* keys.
+    checkEqual(poppy.txFormats.count, 2, "tx_formats array parsed")
+    checkEqual(poppy.rxFormats.count, 5, "rx_formats array parsed")
+
+    // Every entry has "sip_uri": "" — an empty string, not a missing key. If that
+    // reaches SIPCall the INVITE goes out with a blank Request-URI.
+    check(poppy.sipURI == nil, "an empty sip_uri is normalised to nil, not kept as \"\"")
+
+    // Packet time is the make-or-break detail for this device: it can only SEND
+    // 16 ms or 10 ms frames, so the default 20 ms offer would earn a 488.
+    checkEqual(Set(poppy.parsedTxFormats.map(\.frameMs)), Set([16, 10]), "ESP tx ptimes")
+    checkEqual(Set(poppy.parsedRxFormats.map(\.frameMs)), Set([10, 16, 32]), "ESP rx ptimes")
+    checkEqual(poppy.preferredFrameMs, 10, "negotiates a ptime the ESP supports in both directions")
+    check(poppy.preferredFrameMs != 20, "does not fall back to the unsupported 20 ms default")
+
+    // 16 kHz mono is present in both directions, so no resampling is needed.
+    check(poppy.parsedTxFormats.contains { $0.isNativeToAudioEngine },
+          "ESP can send a format AudioEngine renders natively")
+    check(poppy.parsedRxFormats.contains { $0.isNativeToAudioEngine },
+          "ESP accepts a format AudioEngine produces natively")
+
+    // The HA browser softphone is a valid SIP target but not an intercom panel.
+    check(!devices.contains { $0.name == "Patton Mannor" },
+          "the HA browser softphone is not listed as a panel")
+    // Both markers should independently suffice, since only one may be present.
+    let byLocalHA = """
+    {"version":2,"contacts":[{"name":"HA","address":"192.168.7.148","enabled":true,
+     "metadata":{"local_ha":true,"sip_port":5060,"sip_transport":"tcp"}}]}
+    """
+    checkEqual(client.parseVoipRosterForTesting(["roster_json": byLocalHA]).count, 0,
+               "local_ha alone filters the softphone")
+    let byKind = """
+    {"version":2,"contacts":[{"name":"HA","address":"192.168.7.148","enabled":true,
+     "metadata":{"endpoint_kind":"browser","sip_port":5060,"sip_transport":"tcp"}}]}
+    """
+    checkEqual(client.parseVoipRosterForTesting(["roster_json": byKind]).count, 0,
+               "endpoint_kind=browser alone filters the softphone")
+    // An ESPHome endpoint must not be caught by that filter.
+    let esphomeKind = """
+    {"version":2,"contacts":[{"name":"Panel","address":"192.168.7.173","enabled":true,
+     "metadata":{"endpoint_kind":"esphome","local_ha":false,"sip_port":5060,
+                 "sip_transport":"udp"}}]}
+    """
+    checkEqual(client.parseVoipRosterForTesting(["roster_json": esphomeKind]).count, 1,
+               "an esphome endpoint is still listed")
+
+    // Groups route through HA and cannot be dialled directly by this client.
+    check(!devices.contains { $0.name == "CG Casa" }, "conference group is not a direct target")
+    check(!devices.contains { $0.name == "RG Casa" }, "ring group is not a direct target")
+
+    // The compact attribute from the same install must agree with the JSON.
+    let livePhonebook = "Poppy Monitor|192.168.7.173|5060|40000|full_duplex|" +
+        "16000:s16le:1:16;16000:s16le:1:10|" +
+        "48000:s16le:1:10;32000:s16le:1:16;16000:s16le:1:10;16000:s16le:1:16;16000:s16le:1:32|sip_udp," +
+        "Patton Mannor|192.168.7.148|5060|40000|full_duplex|" +
+        "48000:s16le:2:20;48000:s16le:1:20;48000:s16le:1:10;32000:s16le:1:16;32000:s16le:1:10;16000:s16le:1:16;16000:s16le:1:10;16000:s16le:1:20|" +
+        "48000:s16le:2:20;48000:s16le:1:20;48000:s16le:1:10;32000:s16le:1:16;32000:s16le:1:10;16000:s16le:1:16;16000:s16le:1:10;16000:s16le:1:20|sip_tcp"
+
+    let compactDevices = client.parseVoipRosterForTesting(["phonebook": livePhonebook, "count": 2])
+    checkEqual(compactDevices.first?.host, "192.168.7.173", "compact ESP address")
+    checkEqual(compactDevices.first?.preferredFrameMs, 10, "compact path negotiates the same ptime")
+    // Known limitation: the compact rows carry no local_ha / endpoint_kind, so
+    // the softphone cannot be identified there. roster_json is preferred
+    // precisely because it does carry that metadata; this fallback only runs
+    // when roster_json is absent or unparseable.
+    checkEqual(compactDevices.count, 2, "compact rows lack the metadata to filter the softphone")
+
+    // A disabled roster row is not offered as a target.
+    let disabled = """
+    {"version":2,"contacts":[{"name":"Old","address":"192.168.7.99","enabled":false,
+     "metadata":{"sip_port":5060,"sip_transport":"udp"}}]}
+    """
+    checkEqual(client.parseVoipRosterForTesting(["roster_json": disabled]).count, 0,
+               "a disabled entry is skipped")
+}
+
+// MARK: - Discovery reconciliation
+
+print("\nDeviceStore.upsertDiscovered")
+MainActor.assumeIsolated {
+    // Isolate from any real persisted roster.
+    UserDefaults.standard.removeObject(forKey: IntercomDevice.storageKey)
+    UserDefaults.standard.removeObject(forKey: "saved_devices_schema")
+
+    let store = DeviceStore()
+    let original = IntercomDevice(name: "Poppy Monitor", host: "192.168.2.171",
+                                  protocolKind: .legacy)
+    store.add(original)
+
+    // The panel takes a new DHCP lease. Matching on host (the old behaviour)
+    // could never reconcile this — it duplicated the entry and left calls
+    // pointed at the dead address.
+    let moved = IntercomDevice(name: "Poppy Monitor", host: "192.168.2.180",
+                              protocolKind: .voip, sipPort: 5060, sipTransport: .udp,
+                              txFormats: ["16000:s16le:1:20"], rxFormats: ["16000:s16le:1:20"])
+    store.upsertDiscovered(moved)
+
+    checkEqual(store.devices.count, 1, "a device that changed IP is not duplicated")
+    checkEqual(store.devices.first?.host, "192.168.2.180", "the new address is adopted")
+    checkEqual(store.devices.first?.id, original.id, "the stored id is preserved")
+    checkEqual(store.devices.first?.protocolKind, .voip, "discovery refreshes protocol metadata")
+    checkEqual(store.devices.first?.sipPort, 5060, "discovery refreshes the SIP port")
+
+    // Case/diacritic-insensitive identity matching.
+    store.upsertDiscovered(IntercomDevice(name: "poppy monitor", host: "192.168.2.181",
+                                          protocolKind: .voip))
+    checkEqual(store.devices.count, 1, "name matching ignores case")
+    checkEqual(store.devices.first?.host, "192.168.2.181", "case-insensitive match still updates")
+
+    // A genuinely different panel is added.
+    store.upsertDiscovered(IntercomDevice(name: "Gate", host: "192.168.2.190", protocolKind: .voip))
+    checkEqual(store.devices.count, 2, "a genuinely new device is added")
+
+    // An unchanged re-discovery is a no-op, so we don't churn UserDefaults or
+    // re-donate Siri shortcuts on every poll.
+    let unchanged = store.upsertDiscovered(IntercomDevice(name: "Gate", host: "192.168.2.190",
+                                                          protocolKind: .voip))
+    checkEqual(unchanged, false, "an unchanged rediscovery reports no change")
+
+    // The old host-keyed merge could already have written a duplicate for a
+    // panel that moved; collapse it rather than leaving a dead entry behind.
+    store.add(IntercomDevice(name: "Poppy Monitor", host: "192.168.2.171", protocolKind: .legacy))
+    checkEqual(store.devices.filter { $0.name == "Poppy Monitor" }.count, 2,
+               "precondition: a duplicate exists")
+    store.upsertDiscovered(IntercomDevice(name: "Poppy Monitor", host: "192.168.2.181",
+                                          protocolKind: .voip))
+    checkEqual(store.devices.filter { $0.name.lowercased() == "poppy monitor" }.count, 1,
+               "duplicate entries left by the old merge are collapsed")
+    checkEqual(store.devices.count, 2, "collapsing does not disturb other devices")
+    check(store.devices.contains { $0.name == "Gate" }, "unrelated devices survive de-duplication")
+
+    UserDefaults.standard.removeObject(forKey: IntercomDevice.storageKey)
+    UserDefaults.standard.removeObject(forKey: "saved_devices_schema")
+}
+
+// MARK: - Legacy→VoIP fallback trigger
+
+print("\nIntercomConnection.isConnectionRefused")
+do {
+    // ECONNREFUSED means the host is up and nothing is bound to that port, so
+    // the panel is running firmware that dropped the legacy protocol. This is
+    // the signal that must override a stale stored protocolKind.
+    check(IntercomConnection.isConnectionRefused(.posix(.ECONNREFUSED)),
+          "connection refused is recognised")
+    // These mean the panel itself is absent, so legacy reconnect/backoff should
+    // still apply rather than switching protocol.
+    check(!IntercomConnection.isConnectionRefused(.posix(.ETIMEDOUT)),
+          "timeout is not treated as a protocol signal")
+    check(!IntercomConnection.isConnectionRefused(.posix(.EHOSTUNREACH)),
+          "unreachable host is not treated as a protocol signal")
+    check(!IntercomConnection.isConnectionRefused(.posix(.ENETDOWN)),
+          "network down is not treated as a protocol signal")
+    check(!IntercomConnection.isConnectionRefused(nil),
+          "a clean close is not treated as a protocol signal")
+}
+
+// MARK: - SIP URI user part
+
+print("\nSIPCall.uriUser")
+do {
+    // The roster addresses panels by their exact name, and VoIP Stack validates
+    // the Request-URI — so the name must survive, not be slugified.
+    checkEqual(SIPCall.uriUser("Kitchen"), "Kitchen", "preserves a simple name verbatim")
+    checkEqual(SIPCall.uriUser("Poppy Monitor"), "Poppy%20Monitor", "escapes a space rather than lowercasing")
+    checkEqual(SIPCall.uriUser("Salotto"), "Salotto", "preserves capitalisation")
+    checkEqual(SIPCall.uriUser("Front-Door_2"), "Front-Door_2", "keeps unreserved punctuation")
+    checkEqual(SIPCall.uriUser(""), "phone", "falls back for an empty name")
+    checkEqual(SIPCall.uriUser("Caffè"), "Caff%C3%A8", "percent-escapes non-ASCII as UTF-8")
+    // Whatever we emit has to survive our own URI parsing.
+    let uri = "sip:\(SIPCall.uriUser("Poppy Monitor"))@192.168.2.171:5060"
+    checkEqual(IntercomDevice.hostPart(ofSipURI: uri), "192.168.2.171", "escaped user part still parses")
+    checkEqual(IntercomDevice.portPart(ofSipURI: uri), 5060, "escaped user part keeps the port parseable")
 }
 
 // MARK: - RTP payload conversion
@@ -379,6 +678,16 @@ do {
     checkEqual(roundTrip?.sipPort, 5060, "advertised SIP port matches the listener")
     checkEqual(Int(RTPAudioSession.basePort), roundTrip?.rtpPort,
                "advertised RTP port matches the first port we actually bind")
+
+    // When 5060 is taken we bind elsewhere; the advertisement has to follow, or
+    // peers call a port nothing is listening on.
+    let ephemeral = HomeAssistantClient.voipEndpointState(name: "iPhone",
+                                                          ip: "192.168.1.10",
+                                                          sipPort: 54321)
+    checkEqual(ephemeral.components(separatedBy: "|")[2], "54321",
+               "advertises the actually-bound SIP port, not the convention")
+    checkEqual(IntercomDevice.fromVoipEndpointString(ephemeral)?.sipPort, 54321,
+               "ephemeral-port advertisement still parses")
 }
 
 print("\n\(checks - failures)/\(checks) checks passed")

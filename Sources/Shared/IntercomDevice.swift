@@ -110,9 +110,13 @@ struct IntercomDevice: Identifiable, Codable, Hashable, Sendable {
         host = try c.decode(String.self, forKey: .host)
         port = try c.decode(Int.self, forKey: .port)
 
-        // A device saved before VoIP support existed is, by definition, one the
-        // user was talking to over the legacy protocol.
-        protocolKind = try c.decodeIfPresent(DeviceProtocol.self, forKey: .protocolKind) ?? .legacy
+        // A device saved before VoIP support existed was reached over the legacy
+        // protocol *at the time it was saved* — but the panel may have been
+        // upgraded since, which is the common case for anyone installing this
+        // update.  `.auto` still tries legacy first, so a genuinely old panel
+        // behaves exactly as before; it just gains a SIP fallback instead of
+        // failing permanently after a firmware upgrade.
+        protocolKind = try c.decodeIfPresent(DeviceProtocol.self, forKey: .protocolKind) ?? .auto
         sipURI       = try c.decodeIfPresent(String.self, forKey: .sipURI)
         sipPort      = try c.decodeIfPresent(Int.self, forKey: .sipPort) ?? Int(SIPEndpoint.defaultPort)
         sipTransport = try c.decodeIfPresent(SIPTransportKind.self, forKey: .sipTransport) ?? .udp
@@ -164,10 +168,37 @@ struct IntercomDevice: Identifiable, Codable, Hashable, Sendable {
     static func fromRosterEntry(_ raw: [String: Any]) -> IntercomDevice? {
         guard let name = (raw["name"] as? String)?.trimmingCharacters(in: .whitespaces),
               !name.isEmpty
-        else { return nil }
+        else {
+            print("IntercomDevice: roster entry skipped — no name (keys: " +
+                  "\(raw.keys.sorted().joined(separator: ",")))")
+            return nil
+        }
 
+        // A roster row that HA hasn't been given an explicit URI for carries
+        // `"sip_uri": ""` rather than omitting the key.  Normalise that to nil —
+        // an empty string is not a usable URI, and letting it through means
+        // `sipURI ?? synthesised` picks the empty string and we send an INVITE
+        // with a blank Request-URI.
         let metadata = raw["metadata"] as? [String: Any] ?? [:]
-        let sipURI   = (raw["sip_uri"] as? String)?.trimmingCharacters(in: .whitespaces)
+        let sipURI   = (raw["sip_uri"] as? String)?
+            .trimmingCharacters(in: .whitespaces)
+            .nilIfEmpty
+
+        // Entries can be disabled in HA without being removed from the roster.
+        if let enabled = raw["enabled"] as? Bool, !enabled {
+            print("IntercomDevice: roster entry '\(name)' skipped — disabled in HA")
+            return nil
+        }
+
+        // Home Assistant publishes its own browser softphone as a roster contact.
+        // It is a genuine SIP target, but it is not an intercom panel, so it
+        // doesn't belong in this app's device list.
+        let endpointKind = (metadata["endpoint_kind"] as? String)?.lowercased()
+        if (metadata["local_ha"] as? Bool) == true || endpointKind == "browser" {
+            print("IntercomDevice: roster entry '\(name)' skipped — " +
+                  "Home Assistant softphone (kind=\(endpointKind ?? "local_ha"))")
+            return nil
+        }
 
         // Host: prefer the explicit address, else the host part of the SIP URI.
         var host = (raw["address"] as? String)?.trimmingCharacters(in: .whitespaces) ?? ""
@@ -176,7 +207,11 @@ struct IntercomDevice: Identifiable, Codable, Hashable, Sendable {
         let isBridge = (raw["ha_bridge"] as? Bool) ?? false
         // A name-only or group entry has to be dialled through HA; this client
         // only places direct calls, so it is not a usable roster device.
-        guard !host.isEmpty, !(isBridge && sipURI == nil) else { return nil }
+        guard !host.isEmpty, !(isBridge && sipURI == nil) else {
+            let reason = host.isEmpty ? "no address or sip_uri" : "HA-routed group/bridge entry"
+            print("IntercomDevice: roster entry '\(name)' skipped — \(reason)")
+            return nil
+        }
 
         // Transport may appear under either key; `sip_transport` wins.
         let transport = SIPTransportKind(token: metadata["sip_transport"] as? String)
@@ -342,6 +377,13 @@ struct IntercomDevice: Identifiable, Codable, Hashable, Sendable {
     }
 }
 
+extension String {
+    /// Treat a blank string as absent.  Home Assistant's roster uses `""` for
+    /// "not set" throughout rather than omitting keys, so this distinction
+    /// matters wherever a value feeds straight onto the wire.
+    var nilIfEmpty: String? { isEmpty ? nil : self }
+}
+
 // MARK: - Stable identifiers
 
 extension UUID {
@@ -379,7 +421,34 @@ final class DeviceStore: ObservableObject {
 
     private let key = IntercomDevice.storageKey
 
+    /// Bumped whenever persisted devices need rewriting on load.  Changing the
+    /// decode default is not enough on its own: discovery re-saves the roster
+    /// (see App.swift / SettingsView), so a stale value gets written back
+    /// explicitly and then wins over any new default forever.
+    private static let currentSchema = 2
+    private let schemaKey = "saved_devices_schema"
+
     init() { load() }
+
+    /// Rewrite devices persisted by an older build.
+    ///
+    /// Schema < 2 stamped every pre-existing device `.legacy`, on the assumption
+    /// that anything already saved was a legacy panel.  That strands a panel
+    /// upgraded past v2026.7.0: `.legacy` disables the SIP probe, so the app
+    /// retries a port the firmware no longer opens and gives up.  Re-arm those
+    /// devices as `.auto`, which still tries legacy first.
+    ///
+    /// Anything the user pins by hand afterwards is written at the current
+    /// schema and is left alone.
+    nonisolated static func migrate(_ devices: [IntercomDevice],
+                                    fromSchema schema: Int) -> [IntercomDevice] {
+        guard schema < 2 else { return devices }
+        return devices.map { device in
+            var device = device
+            if device.protocolKind == .legacy { device.protocolKind = .auto }
+            return device
+        }
+    }
 
     func add(_ device: IntercomDevice) {
         devices.append(device)
@@ -403,15 +472,103 @@ final class DeviceStore: ObservableObject {
         save()
     }
 
+    /// Reconcile one discovered device into the roster.
+    ///
+    /// Matching is by identity (stable id, else name) and NOT by host, because
+    /// the host is exactly the field that changes: a panel that picks up a new
+    /// DHCP lease would otherwise never match, so the stale entry survived and
+    /// the device was added again as a duplicate. Calls then went to the old
+    /// address and sat on "Connecting…" until the SYN timed out.
+    ///
+    /// The stored `id` is preserved so a live connection, its Live Activity and
+    /// any donated Siri shortcut stay bound to the same entry. Home Assistant is
+    /// authoritative for addressing and protocol metadata, so those are taken
+    /// from the discovered copy.
+    @discardableResult
+    func upsertDiscovered(_ discovered: IntercomDevice) -> Bool {
+        guard let index = devices.firstIndex(where: {
+            Self.isSameEndpoint($0, discovered)
+        }) else {
+            devices.append(discovered)
+            save()
+            print("DeviceStore: discovered new device '\(discovered.name)' at \(discovered.host)")
+            return true
+        }
+
+        let existing = devices[index]
+        var updated  = existing
+        updated.host            = discovered.host
+        updated.port            = discovered.port
+        updated.protocolKind    = discovered.protocolKind
+        updated.sipURI          = discovered.sipURI
+        updated.sipPort         = discovered.sipPort
+        updated.sipTransport    = discovered.sipTransport
+        updated.rtpPort         = discovered.rtpPort
+        updated.txFormats       = discovered.txFormats
+        updated.rxFormats       = discovered.rxFormats
+        updated.extensionNumber = discovered.extensionNumber
+
+        // Host-keyed merging (the old behaviour) could add the same panel twice
+        // when it moved.  Collapse any leftovers so those users don't keep a
+        // dead entry that still shows up in the list and in Siri suggestions.
+        let staleDuplicates = devices.enumerated().filter { offset, candidate in
+            offset != index && Self.isSameEndpoint(candidate, updated)
+        }
+        let removedDuplicates = !staleDuplicates.isEmpty
+
+        guard updated != existing || removedDuplicates else { return false }
+
+        if updated.host != existing.host {
+            print("DeviceStore: '\(existing.name)' moved \(existing.host) → \(updated.host)")
+        } else if updated != existing {
+            print("DeviceStore: '\(existing.name)' metadata refreshed from discovery")
+        }
+        devices[index] = updated
+        if removedDuplicates {
+            print("DeviceStore: removed \(staleDuplicates.count) duplicate entr" +
+                  "\(staleDuplicates.count == 1 ? "y" : "ies") for '\(updated.name)'")
+            let staleOffsets = Set(staleDuplicates.map(\.offset))
+            devices = devices.enumerated()
+                .filter { !staleOffsets.contains($0.offset) }
+                .map(\.element)
+        }
+        save()
+        return true
+    }
+
+    /// Identity match used for de-duplication: same stable id, or same name.
+    nonisolated static func isSameEndpoint(_ a: IntercomDevice, _ b: IntercomDevice) -> Bool {
+        a.id == b.id
+            || a.name.compare(b.name, options: [.caseInsensitive, .diacriticInsensitive])
+                == .orderedSame
+    }
+
     private func load() {
+        let schema = UserDefaults.standard.integer(forKey: schemaKey)   // 0 when never written
         guard let data = UserDefaults.standard.data(forKey: key),
               let decoded = try? JSONDecoder().decode([IntercomDevice].self, from: data)
-        else { return }
-        devices = decoded
+        else {
+            UserDefaults.standard.set(Self.currentSchema, forKey: schemaKey)
+            return
+        }
+
+        if schema < Self.currentSchema {
+            let migrated = Self.migrate(decoded, fromSchema: schema)
+            let rearmed = zip(decoded, migrated).filter { $0.protocolKind != $1.protocolKind }.count
+            if rearmed > 0 {
+                print("DeviceStore: migrated \(rearmed) device(s) from schema \(schema) " +
+                      "— legacy-pinned entries re-armed for protocol probing")
+            }
+            devices = migrated
+            save()   // stamps the new schema
+        } else {
+            devices = decoded
+        }
     }
 
     private func save() {
         guard let data = try? JSONEncoder().encode(devices) else { return }
         UserDefaults.standard.set(data, forKey: key)
+        UserDefaults.standard.set(Self.currentSchema, forKey: schemaKey)
     }
 }
