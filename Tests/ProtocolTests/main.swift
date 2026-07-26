@@ -457,8 +457,8 @@ MainActor.assumeIsolated {
 
     let devices = client.parseVoipRosterForTesting(["roster_json": liveRosterJSON, "count": 4])
     // Four contacts: one ESP panel, one HA browser softphone, two HA groups.
-    // Only the ESP panel is an intercom this app should list.
-    checkEqual(devices.count, 1, "only the ESP panel is listed")
+    // The softphone is never listed; the panel and both groups are.
+    checkEqual(devices.count, 3, "the ESP panel and both groups are listed")
 
     guard let poppy = devices.first(where: { $0.name == "Poppy Monitor" }) else {
         check(false, "Poppy Monitor is discovered"); exit(1)
@@ -514,9 +514,51 @@ MainActor.assumeIsolated {
     checkEqual(client.parseVoipRosterForTesting(["roster_json": esphomeKind]).count, 1,
                "an esphome endpoint is still listed")
 
-    // Groups route through HA and cannot be dialled directly by this client.
-    check(!devices.contains { $0.name == "CG Casa" }, "conference group is not a direct target")
-    check(!devices.contains { $0.name == "RG Casa" }, "ring group is not a direct target")
+    // Groups have no address of their own — they're dialled by name at HA's own
+    // SIP listener (the softphone entry's address: 192.168.7.148:5060 tcp).
+    guard let cgCasa = devices.first(where: { $0.name == "CG Casa" }) else {
+        check(false, "conference group is discovered"); exit(1)
+    }
+    checkEqual(cgCasa.groupKind, .conference, "CG Casa is a conference group")
+    checkEqual(cgCasa.host, "192.168.7.148", "conference group dials the HA softphone's address")
+    checkEqual(cgCasa.sipPort, 5060, "conference group uses the HA softphone's SIP port")
+    checkEqual(cgCasa.sipTransport, .tcp, "conference group uses the HA softphone's transport")
+    checkEqual(cgCasa.groupMembers, ["Poppy Monitor"], "conference group members")
+
+    guard let rgCasa = devices.first(where: { $0.name == "RG Casa" }) else {
+        check(false, "ring group is discovered"); exit(1)
+    }
+    checkEqual(rgCasa.groupKind, .ring, "RG Casa is a ring group")
+    checkEqual(rgCasa.host, "192.168.7.148", "ring group dials the HA softphone's address")
+    checkEqual(rgCasa.sipPort, 5060, "ring group uses the HA softphone's SIP port")
+    checkEqual(rgCasa.sipTransport, .tcp, "ring group uses the HA softphone's transport")
+    checkEqual(rgCasa.groupMembers, ["Poppy Monitor"], "ring group members")
+
+    // A group entry with no HA softphone entry anywhere in the roster has no
+    // dialable target and is skipped, same as before this app understood groups.
+    let groupWithoutBridge = """
+    [{"name": "AllRooms", "ha_bridge": true,
+      "metadata": {"group_type": "ring", "members": ["Salotto"]}}]
+    """
+    checkEqual(IntercomDevice.fromRosterJSON(groupWithoutBridge).count, 0,
+               "a group with no HA softphone entry in the roster has no dial target")
+
+    // Isolated two-pass resolution: a group entry paired with just an HA
+    // softphone entry (no panels) still resolves.
+    let groupWithBridge = """
+    [{"name": "HA", "address": "10.0.0.9", "enabled": true,
+      "metadata": {"local_ha": true, "sip_port": 5061, "sip_transport": "udp"}},
+     {"name": "RG Test", "ha_bridge": true, "enabled": true,
+      "metadata": {"group_type": "ring", "members": ["Salotto", "Gate"]}}]
+    """
+    let resolved = IntercomDevice.fromRosterJSON(groupWithBridge)
+    checkEqual(resolved.count, 1, "only the group is listed; the softphone itself is excluded")
+    checkEqual(resolved.first?.name, "RG Test", "resolved entry is the group")
+    checkEqual(resolved.first?.host, "10.0.0.9", "group borrows the softphone's host")
+    checkEqual(resolved.first?.sipPort, 5061, "group borrows the softphone's SIP port")
+    checkEqual(resolved.first?.sipTransport, .udp, "group borrows the softphone's transport")
+    checkEqual(resolved.first?.groupKind, .ring, "group_type ring parses to .ring")
+    checkEqual(resolved.first?.groupMembers, ["Salotto", "Gate"], "group members carry through")
 
     // The compact attribute from the same install must agree with the JSON.
     let livePhonebook = "Poppy Monitor|192.168.7.173|5060|40000|full_duplex|" +
