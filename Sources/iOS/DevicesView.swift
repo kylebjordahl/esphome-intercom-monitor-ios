@@ -132,9 +132,14 @@ private struct DeviceRow: View {
 
     var body: some View {
         HStack {
+            if let groupKind = device.groupKind {
+                Image(systemName: groupKind == .ring ? "person.2.wave.2" : "person.3")
+                    .foregroundStyle(.secondary)
+                    .frame(width: 20)
+            }
             VStack(alignment: .leading, spacing: 2) {
                 Text(device.name).font(.headline)
-                Text("\(device.host):\(device.port)")
+                Text(subtitle)
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -144,6 +149,15 @@ private struct DeviceRow: View {
             }
         }
         .padding(.vertical, 4)
+    }
+
+    // A group's `host`/`port` are Home Assistant's own SIP listener, not
+    // meaningful to the user — show what the group actually is instead.
+    private var subtitle: String {
+        guard let groupKind = device.groupKind else { return "\(device.host):\(device.port)" }
+        let kind = groupKind == .ring ? "Ring group" : "Conference"
+        let count = device.groupMembers.count
+        return count > 0 ? "\(kind) · \(count) member\(count == 1 ? "" : "s")" : kind
     }
 
     @ViewBuilder

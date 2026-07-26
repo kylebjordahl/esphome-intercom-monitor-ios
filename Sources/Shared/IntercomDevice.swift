@@ -23,9 +23,20 @@ enum DeviceProtocol: String, Codable, Sendable, CaseIterable {
     }
 }
 
-// A discoverable/callable intercom endpoint (an ESPHome panel, or the iPhone/
-// Watch itself acting as a peer).  `id` is stable so it can key both the device
-// roster and the live connection for that device.
+/// A ring group forks a call to every member in parallel (first to answer wins);
+/// a conference group joins the caller into an HA-mixed room other members can
+/// join at any time by calling the same name.  Home Assistant owns the routing —
+/// this app just dials the group's name at HA's own SIP listener, same as it
+/// would dial any other contact (docs/GROUPS.md in n-IA-hane/esphome-intercom).
+enum GroupKind: String, Codable, Sendable {
+    case ring
+    case conference
+}
+
+// A discoverable/callable intercom endpoint (an ESPHome panel, a ring/conference
+// group hosted by Home Assistant, or the iPhone/Watch itself acting as a peer).
+// `id` is stable so it can key both the device roster and the live connection
+// for that device.
 struct IntercomDevice: Identifiable, Codable, Hashable, Sendable {
     var id: UUID
     var name: String
@@ -53,6 +64,12 @@ struct IntercomDevice: Identifiable, Codable, Hashable, Sendable {
     /// Internal dial-plan alias, when the roster defines one.
     var extensionNumber: String?
 
+    /// Set only for a ring/conference group entry — nil for a real panel.
+    var groupKind: GroupKind?
+    /// Member names, when the roster's group entry lists them.  Informational
+    /// only (display); dialing doesn't need it.
+    var groupMembers: [String] = []
+
     init(id: UUID = UUID(),
          name: String,
          host: String,
@@ -64,7 +81,9 @@ struct IntercomDevice: Identifiable, Codable, Hashable, Sendable {
          rtpPort: Int? = nil,
          txFormats: [String] = [],
          rxFormats: [String] = [],
-         extensionNumber: String? = nil) {
+         extensionNumber: String? = nil,
+         groupKind: GroupKind? = nil,
+         groupMembers: [String] = []) {
         self.id   = id
         self.name = name
         self.host = host
@@ -77,6 +96,8 @@ struct IntercomDevice: Identifiable, Codable, Hashable, Sendable {
         self.txFormats       = txFormats
         self.rxFormats       = rxFormats
         self.extensionNumber = extensionNumber
+        self.groupKind       = groupKind
+        self.groupMembers    = groupMembers
     }
 
     // MARK: - Negotiation helpers
@@ -101,6 +122,7 @@ struct IntercomDevice: Identifiable, Codable, Hashable, Sendable {
         case id, name, host, port
         case protocolKind, sipURI, sipPort, sipTransport, rtpPort
         case txFormats, rxFormats, extensionNumber
+        case groupKind, groupMembers
     }
 
     init(from decoder: Decoder) throws {
@@ -124,6 +146,8 @@ struct IntercomDevice: Identifiable, Codable, Hashable, Sendable {
         txFormats    = try c.decodeIfPresent([String].self, forKey: .txFormats) ?? []
         rxFormats    = try c.decodeIfPresent([String].self, forKey: .rxFormats) ?? []
         extensionNumber = try c.decodeIfPresent(String.self, forKey: .extensionNumber)
+        groupKind    = try c.decodeIfPresent(GroupKind.self, forKey: .groupKind)
+        groupMembers = try c.decodeIfPresent([String].self, forKey: .groupMembers) ?? []
     }
 
     /// UserDefaults key under which the saved roster is persisted.  Shared so the
@@ -155,17 +179,33 @@ struct IntercomDevice: Identifiable, Codable, Hashable, Sendable {
 
     // MARK: - VoIP roster parsing
 
+    /// Resolved address of Home Assistant's own SIP listener (the "HA softphone"
+    /// roster entry) — the target this app dials a ring/conference group's name
+    /// against.  A group entry carries no address of its own; HA's dialplan
+    /// resolver recognises the name and runs the group logic once the INVITE
+    /// reaches it (docs/GROUPS.md, docs/DIALPLAN_RESOLVER.md in
+    /// n-IA-hane/esphome-intercom).
+    struct HABridgeTarget {
+        let host: String
+        let port: Int
+        let transport: SIPTransportKind
+    }
+
     /// Parse one entry of the canonical JSON roster published as
     /// `sensor.voip_phonebook` by firmware >= v2026.7.0.
     ///
     /// Fields (docs/PHONEBOOK_PROTOCOL.md): `id`, `name`, `address`, `sip_uri`,
     /// `extension`, `number`, `port`, `ha_bridge`, and a `metadata` object
     /// carrying `transport` / `sip_transport` / `sip_port` / `rtp_port` plus
-    /// audio-format metadata.
+    /// audio-format metadata.  A ring/conference group entry additionally
+    /// carries `metadata.group_type` and `metadata.members`.
     ///
-    /// Entries that are pure HA routing constructs (`ha_bridge` groups with no
-    /// address) are skipped — they are not directly callable by this client.
-    static func fromRosterEntry(_ raw: [String: Any]) -> IntercomDevice? {
+    /// `haBridge`, when supplied by `fromRosterEntries`, is the address of HA's
+    /// own SIP listener — the only way a group entry (which has no address of
+    /// its own) can be made callable.  Any other `ha_bridge` entry (no
+    /// recognised `group_type`) is still skipped — it's a pure HA routing
+    /// construct this client can't dial.
+    static func fromRosterEntry(_ raw: [String: Any], haBridge: HABridgeTarget? = nil) -> IntercomDevice? {
         guard let name = (raw["name"] as? String)?.trimmingCharacters(in: .whitespaces),
               !name.isEmpty
         else {
@@ -192,7 +232,8 @@ struct IntercomDevice: Identifiable, Codable, Hashable, Sendable {
 
         // Home Assistant publishes its own browser softphone as a roster contact.
         // It is a genuine SIP target, but it is not an intercom panel, so it
-        // doesn't belong in this app's device list.
+        // doesn't belong in this app's device list.  (Its address is captured
+        // separately by fromRosterEntries as the group-dialing bridge target.)
         let endpointKind = (metadata["endpoint_kind"] as? String)?.lowercased()
         if (metadata["local_ha"] as? Bool) == true || endpointKind == "browser" {
             print("IntercomDevice: roster entry '\(name)' skipped — " +
@@ -200,14 +241,46 @@ struct IntercomDevice: Identifiable, Codable, Hashable, Sendable {
             return nil
         }
 
+        let isBridge = (raw["ha_bridge"] as? Bool) ?? false
+        let groupKind: GroupKind? = switch (metadata["group_type"] as? String)?.lowercased() {
+        case "ring":       .ring
+        case "conference": .conference
+        default:           nil
+        }
+
+        if isBridge, let groupKind {
+            guard let haBridge else {
+                print("IntercomDevice: roster entry '\(name)' skipped — " +
+                      "\(groupKind) group has no dialable HA bridge address " +
+                      "(no HA softphone entry found in this roster)")
+                return nil
+            }
+            let stableID = (raw["id"] as? String).flatMap(UUID.init(uuidString:))
+                ?? UUID(stableFrom: "voip-group:\(name)@\(haBridge.host)")
+            return IntercomDevice(
+                id: stableID,
+                name: name,
+                host: haBridge.host,
+                port: 6054,
+                protocolKind: .voip,
+                // No sipURI: let SIPCall synthesise sip:<name>@bridgeHost:bridgePort,
+                // exactly as it does for any device with no roster URI.
+                sipURI: nil,
+                sipPort: haBridge.port,
+                sipTransport: haBridge.transport,
+                extensionNumber: raw["extension"] as? String,
+                groupKind: groupKind,
+                groupMembers: (metadata["members"] as? [String]) ?? [])
+        }
+
         // Host: prefer the explicit address, else the host part of the SIP URI.
         var host = (raw["address"] as? String)?.trimmingCharacters(in: .whitespaces) ?? ""
         if host.isEmpty, let sipURI { host = hostPart(ofSipURI: sipURI) ?? "" }
 
-        let isBridge = (raw["ha_bridge"] as? Bool) ?? false
-        // A name-only or group entry has to be dialled through HA; this client
-        // only places direct calls, so it is not a usable roster device.
-        guard !host.isEmpty, !(isBridge && sipURI == nil) else {
+        // A name-only or unrecognised bridge entry has to be dialled through HA;
+        // this client only places direct calls, so it is not a usable roster
+        // device.
+        guard !host.isEmpty, !isBridge else {
             let reason = host.isEmpty ? "no address or sip_uri" : "HA-routed group/bridge entry"
             print("IntercomDevice: roster entry '\(name)' skipped — \(reason)")
             return nil
@@ -242,6 +315,37 @@ struct IntercomDevice: Identifiable, Codable, Hashable, Sendable {
             txFormats: formatList(metadata["tx_format"] ?? metadata["tx_formats"]),
             rxFormats: formatList(metadata["rx_format"] ?? metadata["rx_formats"]),
             extensionNumber: raw["extension"] as? String)
+    }
+
+    /// Parse a whole set of roster entries in one pass, so a ring/conference
+    /// group entry (which carries no address of its own) can borrow the
+    /// address of the HA softphone entry found elsewhere in the same roster.
+    static func fromRosterEntries(_ raw: [[String: Any]]) -> [IntercomDevice] {
+        let haBridge: HABridgeTarget? = raw.lazy.compactMap { entry -> HABridgeTarget? in
+            let metadata = entry["metadata"] as? [String: Any] ?? [:]
+            let endpointKind = (metadata["endpoint_kind"] as? String)?.lowercased()
+            guard (metadata["local_ha"] as? Bool) == true || endpointKind == "browser" else {
+                return nil
+            }
+
+            let sipURI = (entry["sip_uri"] as? String)?.trimmingCharacters(in: .whitespaces).nilIfEmpty
+            var host = (entry["address"] as? String)?.trimmingCharacters(in: .whitespaces) ?? ""
+            if host.isEmpty, let sipURI { host = hostPart(ofSipURI: sipURI) ?? "" }
+            guard !host.isEmpty else { return nil }
+
+            let transport = SIPTransportKind(token: metadata["sip_transport"] as? String)
+                ?? SIPTransportKind(token: metadata["transport"] as? String)
+                ?? sipURI.flatMap { SIPTransportKind(token: uriParameter("transport", in: $0)) }
+                ?? .udp
+            let port = intValue(metadata["sip_port"])
+                ?? intValue(entry["port"])
+                ?? sipURI.flatMap { portPart(ofSipURI: $0) }
+                ?? Int(SIPEndpoint.defaultPort)
+
+            return HABridgeTarget(host: host, port: port, transport: transport)
+        }.first
+
+        return raw.compactMap { fromRosterEntry($0, haBridge: haBridge) }
     }
 
     /// Parse the per-device endpoint state published by firmware >= v2026.7.0 as
@@ -323,7 +427,7 @@ struct IntercomDevice: Identifiable, Codable, Hashable, Sendable {
             entries = []
         }
 
-        return entries.compactMap(fromRosterEntry)
+        return fromRosterEntries(entries)
     }
 
     // MARK: - Parsing helpers

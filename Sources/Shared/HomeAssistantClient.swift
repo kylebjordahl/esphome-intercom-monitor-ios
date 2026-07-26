@@ -101,11 +101,13 @@ final class HomeAssistantClient: ObservableObject {
                         ?? (attrs["count"] as? String).flatMap(Int.init)
                     if let reported, reported > 0 {
                         setStatus("sensor.voip_phonebook lists \(reported) entr" +
-                                  "\(reported == 1 ? "y" : "ies"), but none are intercom " +
-                                  "panels this app can dial directly — ring/conference " +
-                                  "groups and the Home Assistant softphone are excluded. " +
-                                  "If a panel is missing, check it is online and publishing " +
-                                  "its VoIP endpoint.")
+                                  "\(reported == 1 ? "y" : "ies"), but none are directly " +
+                                  "callable — the Home Assistant softphone entry is always " +
+                                  "excluded. If a panel is missing, check it is online and " +
+                                  "publishing its VoIP endpoint; if a ring or conference group " +
+                                  "is missing, make sure Home Assistant's own SIP endpoint " +
+                                  "(softphone) is enabled in VoIP Stack — that's the address " +
+                                  "this app dials groups through.")
                     } else {
                         setStatus("sensor.voip_phonebook exists but is empty. Check that your " +
                                   "ESP devices are online and publishing their VoIP endpoint.")
@@ -169,12 +171,12 @@ final class HomeAssistantClient: ObservableObject {
         // Some HA versions hand back already-decoded JSON rather than a string.
         for key in ["roster_json", "contacts", "roster", "entries"] {
             if let array = attributes[key] as? [[String: Any]] {
-                let parsed = array.compactMap(IntercomDevice.fromRosterEntry)
+                let parsed = IntercomDevice.fromRosterEntries(array)
                 if !parsed.isEmpty { return parsed }
             }
             if let object = attributes[key] as? [String: Any],
                let contacts = object["contacts"] as? [[String: Any]] {
-                let parsed = contacts.compactMap(IntercomDevice.fromRosterEntry)
+                let parsed = IntercomDevice.fromRosterEntries(contacts)
                 if !parsed.isEmpty { return parsed }
             }
         }
