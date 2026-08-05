@@ -278,10 +278,12 @@ final class IntercomSession: NSObject, ObservableObject {
                 audioEngine.addPlayerAndDrain(for: conn.id)
             }
 
-        case .reconnecting:
-            // The connection is retrying internally (see IntercomConnection) —
-            // keep it in the list so the UI shows "Reconnecting…" and drop its
-            // audio player like any other non-active state.
+        case .reconnecting, .callFailed:
+            // .reconnecting retries internally; .callFailed shows why a call we
+            // placed didn't connect (busy/no answer/declined/dropped) and clears
+            // itself a few seconds later — or immediately via the hang-up button
+            // — either path drives it to .disconnected, handled below. Keep the
+            // row for now, but drop its audio player like any non-active state.
             guard connections.contains(where: { $0.id == conn.id }) else { return }
             audioEngine.removePlayer(for: conn.id)
             teardownAudioIfIdle()

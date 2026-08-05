@@ -9,6 +9,7 @@ enum ConnectionState: Equatable, Sendable {
     case incoming   // received START/INVITE from remote, ringing, waiting for user
     case active
     case reconnecting   // socket dropped without an explicit HANGUP/DECLINE; retrying
+    case callFailed(String)   // a call we placed didn't connect: busy, no answer, declined, ...
     case error(String)
 }
 
@@ -103,6 +104,12 @@ final class IntercomConnection: ObservableObject, Identifiable {
     private var reconnectTask: Task<Void, Never>?
     private static let maxReconnectAttempts = 5
     private static let maxReconnectDelay: Double = 16
+
+    /// A call we placed just landed on `.callFailed` (busy/no answer/declined/
+    /// dropped) — auto-clear the row after a few seconds so the device is always
+    /// redialable again, even if the user never taps the dismiss button.
+    private var callFailedDismissTimer: Timer?
+    private static let callFailedAutoDismissDelay: TimeInterval = 4
 
     /// Half-duplex playback volume: muted while the user is talking, so the mic
     /// doesn't pick up this call's own audio from the speaker and create an
@@ -246,6 +253,8 @@ final class IntercomConnection: ObservableObject, Identifiable {
         reconnectTask = nil
         pingTimer?.invalidate()
         pingTimer = nil
+        callFailedDismissTimer?.invalidate()
+        callFailedDismissTimer = nil
         stopAudioKeepalive()
         nwConn?.cancel()
         nwConn = nil
@@ -332,6 +341,11 @@ final class IntercomConnection: ObservableObject, Identifiable {
                 // and reports the resulting state back through handleSIPState.
                 sipCall?.hangup()
             }
+        case .callFailed:
+            // Nothing live to tear down — the SIPCall already reached a
+            // terminal state on its own. Just clear the row immediately
+            // instead of waiting for the auto-dismiss timer.
+            disconnect()
         default:
             break
         }
@@ -385,9 +399,21 @@ final class IntercomConnection: ObservableObject, Identifiable {
             callId = ""
             sipCall?.teardown()
             sipCall = nil
-            // A server-side call has nothing to return to; a client-side one
-            // keeps its roster entry so the user can redial.
-            state = isServerSide ? .disconnected : .idle
+            if isServerSide {
+                // A server-side call has nothing to return to.
+                state = .disconnected
+            } else if Self.isNoticeworthyEnd(reason) {
+                // A call we placed didn't connect — surface why instead of
+                // silently collapsing to a blank "Connected (idle)" row that
+                // the UI had no way to dismiss (every reason used to map here).
+                state = .callFailed(reason)
+                scheduleCallFailedAutoDismiss()
+            } else {
+                // Ordinary termination: an established call ended (by us or the
+                // peer), or we cancelled our own still-ringing attempt. Keep the
+                // roster entry so the user can redial.
+                state = .idle
+            }
         case .failed(let reason):
             print("IntercomConnection: [\(device.name)] SIP call failed — \(reason)")
             callId = ""
@@ -407,6 +433,27 @@ final class IntercomConnection: ObservableObject, Identifiable {
                 return
             }
             state = .error(reason)
+        }
+    }
+
+    /// Reasons from `SIPCall.State.ended` worth surfacing as `.callFailed`
+    /// rather than quietly reverting a client-side connection to `.idle`.
+    private static func isNoticeworthyEnd(_ reason: String) -> Bool {
+        switch reason {
+        case "busy", "declined", "no answer", "signaling closed": return true
+        default: return false
+        }
+    }
+
+    private func scheduleCallFailedAutoDismiss() {
+        callFailedDismissTimer?.invalidate()
+        callFailedDismissTimer = Timer.scheduledTimer(
+            withTimeInterval: Self.callFailedAutoDismissDelay, repeats: false
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self, case .callFailed = self.state else { return }
+                self.disconnect()
+            }
         }
     }
 

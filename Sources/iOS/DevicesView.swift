@@ -178,6 +178,10 @@ private struct DeviceRow: View {
                 .font(.caption)
         case .connecting, .reconnecting:
             ProgressView().scaleEffect(0.6)
+        case .callFailed:
+            Image(systemName: "phone.down.fill")
+                .foregroundStyle(.red)
+                .font(.caption)
         default:
             EmptyView()
         }
