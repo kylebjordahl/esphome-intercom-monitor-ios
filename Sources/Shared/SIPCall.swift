@@ -32,6 +32,15 @@ final class SIPCall {
     private(set) var state: State = .idle {
         didSet {
             guard state != oldValue else { return }
+            // The no-answer timer only ever needs to span one ringing attempt —
+            // cancel it the moment we leave .calling/.remoteRinging for any
+            // reason (answered, busy, cancelled, failed, ...).
+            switch state {
+            case .calling, .remoteRinging: break
+            default:
+                noAnswerTimer?.invalidate()
+                noAnswerTimer = nil
+            }
             onStateChange?(state)
         }
     }
@@ -59,6 +68,13 @@ final class SIPCall {
     private var localURI: String
     private var remoteURI: String
     private var localDisplayName: String
+
+    /// Belt-and-braces for a peer that never sends any final response at all —
+    /// e.g. a device that's already in another call and just keeps ringing
+    /// instead of returning 486.  Without this, a call with no answer sits in
+    /// .calling/.remoteRinging forever with no way to reach a terminal state.
+    private var noAnswerTimer: Timer?
+    private static let noAnswerTimeout: TimeInterval = 45
 
     /// Retained so CANCEL and 487 can reference the original transaction.
     private var pendingInvite: SIPMessage?
@@ -193,6 +209,19 @@ final class SIPCall {
         conn.start(queue: .global(qos: .userInitiated))
         receiveLoop(on: conn)
         state = .calling
+        startNoAnswerTimer()
+    }
+
+    private func startNoAnswerTimer() {
+        noAnswerTimer?.invalidate()
+        noAnswerTimer = Timer.scheduledTimer(withTimeInterval: Self.noAnswerTimeout, repeats: false) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self, self.state == .calling || self.state == .remoteRinging else { return }
+                print("SIPCall: no answer after \(Self.noAnswerTimeout)s — cancelling callID=\(self.callID)")
+                self.sendCancel()
+                self.state = .ended("no answer")
+            }
+        }
     }
 
     private func sendInitialInvite() {
@@ -289,6 +318,8 @@ final class SIPCall {
 
     /// Release sockets.  Safe to call repeatedly.
     func teardown() {
+        noAnswerTimer?.invalidate()
+        noAnswerTimer = nil
         media?.stop()
         media = nil
         signaling?.cancel()
@@ -358,7 +389,9 @@ final class SIPCall {
             // than silently failing.
             state = .failed(code == 401 ? "auth_required_unsupported"
                                         : "proxy_auth_required_unsupported")
-        case 486:
+        case 486, 480, 600:
+            // Busy Here / Temporarily Unavailable / Busy Everywhere — all mean
+            // the same thing to the user: the contact is already on a call.
             state = .ended("busy")
         case 487:
             state = .ended("cancelled")

@@ -72,6 +72,7 @@ struct ActiveCallView: View {
         case .incoming:     return "incoming"
         case .active:       return "active"
         case .reconnecting: return "reconnecting"
+        case .callFailed(let reason): return "call failed: \(reason)"
         case .error(let e): return "error: \(e)"
         case .disconnected: return "disconnected"
         }
