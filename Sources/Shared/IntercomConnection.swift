@@ -24,6 +24,9 @@ enum ConnectionState: Equatable, Sendable {
 //   .voip   — SIP/SDP signaling with RTP/UDP L16 media (`voip-pcm/1`), used by
 //             firmware from v2026.7.0, which retired the PBX-lite contract
 //             entirely.  Delegated to SIPCall.
+//   .rtsp   — a listen-only RTSP/RTSPS audio stream (an IP camera or a
+//             go2rtc/Frigate restream), delegated to RTSPStreamSession.  Not a
+//             call at all: it can never be incoming, and `sendAudio` is a no-op.
 //
 // Keeping both behind this facade is deliberate: IntercomSession, every SwiftUI
 // view, the watchOS app and the Live Activity intents all talk to this type, so
@@ -69,8 +72,13 @@ final class IntercomConnection: ObservableObject, Identifiable {
     /// Which stack this connection is actually driving.  Resolved from the
     /// device's `protocolKind`; `.auto` starts on `.legacy` and falls forward to
     /// `.voip` if the legacy port refuses the connection (see `probeFailed`).
-    private enum Mode { case legacy, voip }
+    /// `.rtsp` is never probed into or out of — it's a different kind of thing.
+    private enum Mode { case legacy, voip, rtsp }
     private var mode: Mode
+
+    /// True when this endpoint can only be listened to, so the UI hides
+    /// push-to-talk and the session can run the audio engine without a mic.
+    var isListenOnly: Bool { mode == .rtsp }
     /// True while an `.auto` device is still being probed, so a legacy connect
     /// failure switches protocol instead of entering the reconnect backoff.
     private var isProbing: Bool
@@ -94,6 +102,10 @@ final class IntercomConnection: ObservableObject, Identifiable {
 
     private var sipCall: SIPCall?
 
+    // MARK: - RTSP transport state
+
+    private var rtspSession: RTSPStreamSession?
+
     // MARK: - Auto-reconnect
 
     // Set whenever a HANGUP/DECLINE is sent or received, or disconnect() is
@@ -109,7 +121,11 @@ final class IntercomConnection: ObservableObject, Identifiable {
     /// dropped) — auto-clear the row after a few seconds so the device is always
     /// redialable again, even if the user never taps the dismiss button.
     private var callFailedDismissTimer: Timer?
-    private static let callFailedAutoDismissDelay: TimeInterval = 4
+
+    /// How long a `.callFailed` row lingers before clearing itself.  A stream
+    /// failure carries a message the user has to read and act on ("check the
+    /// username and password"), unlike a SIP busy/no-answer which is self-evident.
+    private var callFailedAutoDismissDelay: TimeInterval { mode == .rtsp ? 12 : 4 }
 
     /// Half-duplex playback volume: muted while the user is talking, so the mic
     /// doesn't pick up this call's own audio from the speaker and create an
@@ -133,6 +149,7 @@ final class IntercomConnection: ObservableObject, Identifiable {
         switch device.protocolKind {
         case .legacy: self.mode = .legacy; self.isProbing = false
         case .voip:   self.mode = .voip;   self.isProbing = false
+        case .rtsp:   self.mode = .rtsp;   self.isProbing = false
         // Probe legacy first: the PBX-lite port is a reliable discriminator —
         // v2026.7.0+ firmware doesn't listen on it, so a refused connect means
         // the panel is a SIP endpoint.
@@ -173,6 +190,7 @@ final class IntercomConnection: ObservableObject, Identifiable {
         switch mode {
         case .legacy: connectLegacy()
         case .voip:   connectVoIP()
+        case .rtsp:   connectRTSP()
         }
     }
 
@@ -233,9 +251,39 @@ final class IntercomConnection: ObservableObject, Identifiable {
         }
     }
 
+    /// Open the RTSP stream.  There is no signaling handshake to wait for and
+    /// nothing to dial: for a monitor, connecting *is* the call, so the state
+    /// machine goes straight from `.connecting` to `.active` when media starts.
+    private func connectRTSP() {
+        guard let url = device.streamURL?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !url.isEmpty else {
+            state = .error("No stream URL configured")
+            return
+        }
+        guard let session = RTSPStreamSession(
+            url: url,
+            credentials: StreamCredentialStore.load(for: device.id)) else {
+            state = .error("Not a valid rtsp:// or rtsps:// URL")
+            return
+        }
+
+        explicitEnd = false
+        rtspSession = session
+        session.onAudioReceived = { [weak self] pcm in
+            self?.onAudioReceived?(pcm)
+        }
+        session.onStateChange = { [weak self] streamState in
+            Task { @MainActor [weak self] in self?.handleRTSPState(streamState) }
+        }
+        state = .connecting
+        session.start()
+    }
+
     func startAccepted() {
         guard isServerSide else { return }
         switch mode {
+        case .rtsp:
+            break   // a stream is never inbound
         case .legacy:
             guard let conn = nwConn else { return }
             state = .connecting
@@ -260,6 +308,8 @@ final class IntercomConnection: ObservableObject, Identifiable {
         nwConn = nil
         sipCall?.teardown()
         sipCall = nil
+        rtspSession?.stop()
+        rtspSession = nil
         receiveBuffer.removeAll()
         callId = ""
         state  = .disconnected
@@ -294,6 +344,11 @@ final class IntercomConnection: ObservableObject, Identifiable {
             call.isTalking = isTalking
             call.dial()
             state = .outgoing
+
+        case .rtsp:
+            // Unreachable: connect() starts the stream, so an RTSP connection
+            // never sits in .idle waiting to be dialled.
+            break
         }
     }
 
@@ -301,6 +356,8 @@ final class IntercomConnection: ObservableObject, Identifiable {
     func answer() {
         guard case .incoming = state else { return }
         switch mode {
+        case .rtsp:
+            break   // a stream never rings
         case .legacy:
             send(.answer(callId: callId))
             state = .active
@@ -315,6 +372,8 @@ final class IntercomConnection: ObservableObject, Identifiable {
         guard case .incoming = state else { return }
         explicitEnd = true
         switch mode {
+        case .rtsp:
+            break   // a stream never rings
         case .legacy:
             send(.decline(callId: callId))
             callId = ""
@@ -340,6 +399,12 @@ final class IntercomConnection: ObservableObject, Identifiable {
                 // CANCEL vs BYE depends on how far the dialog got; SIPCall knows
                 // and reports the resulting state back through handleSIPState.
                 sipCall?.hangup()
+            case .rtsp:
+                // TEARDOWN + close, so the camera frees the session slot now
+                // rather than when it times out.
+                rtspSession?.stop()
+                rtspSession = nil
+                state = .idle
             }
         case .callFailed:
             // Nothing live to tear down — the SIPCall already reached a
@@ -360,6 +425,9 @@ final class IntercomConnection: ObservableObject, Identifiable {
         switch mode {
         case .legacy: send(.audio(data))
         case .voip:   sipCall?.sendAudio(data)
+        // Listen-only: an RTSP stream has no return path at all.  Dropping the
+        // mic here (rather than earlier) keeps the caller's fan-out loop simple.
+        case .rtsp:   break
         }
     }
 
@@ -436,6 +504,34 @@ final class IntercomConnection: ObservableObject, Identifiable {
         }
     }
 
+    // MARK: - RTSP bridging
+
+    private func handleRTSPState(_ streamState: RTSPStreamSession.State) {
+        switch streamState {
+        case .idle:
+            break
+        case .connecting:
+            state = .connecting
+        case .reconnecting:
+            // The stream session owns its own backoff (a monitor is worth
+            // chasing for hours), so this is purely a UI state here — the legacy
+            // reconnect machinery is not involved.
+            state = .reconnecting
+        case .playing:
+            state = .active
+        case .failed(let reason):
+            print("IntercomConnection: [\(device.name)] stream failed — \(reason)")
+            explicitEnd = true
+            rtspSession?.stop()
+            rtspSession = nil
+            // `.callFailed` rather than `.error`: it keeps the row on screen long
+            // enough to read *why* (wrong password, no audio track, unsupported
+            // codec) and then clears itself, where `.error` is dropped at once.
+            state = .callFailed(reason)
+            scheduleCallFailedAutoDismiss()
+        }
+    }
+
     /// Reasons from `SIPCall.State.ended` worth surfacing as `.callFailed`
     /// rather than quietly reverting a client-side connection to `.idle`.
     private static func isNoticeworthyEnd(_ reason: String) -> Bool {
@@ -448,7 +544,7 @@ final class IntercomConnection: ObservableObject, Identifiable {
     private func scheduleCallFailedAutoDismiss() {
         callFailedDismissTimer?.invalidate()
         callFailedDismissTimer = Timer.scheduledTimer(
-            withTimeInterval: Self.callFailedAutoDismissDelay, repeats: false
+            withTimeInterval: callFailedAutoDismissDelay, repeats: false
         ) { [weak self] _ in
             Task { @MainActor [weak self] in
                 guard let self, case .callFailed = self.state else { return }

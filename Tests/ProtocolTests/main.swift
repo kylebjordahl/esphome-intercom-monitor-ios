@@ -732,6 +732,398 @@ do {
                "ephemeral-port advertisement still parses")
 }
 
+// MARK: - RTSP URL parsing
+
+print("\nRTSPTarget")
+do {
+    let plain = RTSPTarget.parse("rtsp://192.168.1.20/audio")
+    checkEqual(plain?.host, "192.168.1.20", "host")
+    checkEqual(plain?.port, 554, "default RTSP port")
+    checkEqual(plain?.isSecure, false, "rtsp:// is not TLS")
+    checkEqual(plain?.uri, "rtsp://192.168.1.20/audio", "request URI round-trips")
+
+    checkEqual(RTSPTarget.parse("rtsps://cam.local/ch0")?.port, 322,
+               "default RTSPS port")
+    checkEqual(RTSPTarget.parse("rtsps://cam.local/ch0")?.isSecure, true,
+               "rtsps:// is TLS")
+
+    // A URL with no path still needs a request URI a server will accept.
+    checkEqual(RTSPTarget.parse("rtsp://cam.local")?.uri, "rtsp://cam.local/",
+               "empty path becomes /")
+
+    // Credentials must come out of the URI — it is what digest hashes, and what
+    // gets persisted in the (plain-text) device roster.
+    let authed = RTSPTarget.parse("rtsp://admin:sec%40ret@cam.local:8554/ch0?x=1")
+    checkEqual(authed?.username, "admin", "username from userinfo")
+    checkEqual(authed?.password, "sec@ret", "percent-decoded password")
+    checkEqual(authed?.port, 8554, "explicit port")
+    checkEqual(authed?.uri, "rtsp://cam.local:8554/ch0?x=1",
+               "credentials stripped, query preserved")
+
+    // Cameras ship passwords containing '@' more often than anyone would like.
+    let atSign = RTSPTarget.parse("rtsp://admin:p@ss@cam.local/audio")
+    checkEqual(atSign?.host, "cam.local", "splits on the LAST @")
+    checkEqual(atSign?.password, "p@ss", "password may contain @")
+
+    check(RTSPTarget.parse("http://cam.local/audio") == nil, "rejects a non-RTSP scheme")
+    check(RTSPTarget.parse("   ") == nil, "rejects blank input")
+    check(RTSPTarget.parse("rtsp://cam.local:notaport/x") == nil, "rejects a bad port")
+    // No scheme at all is accepted as rtsp:// so a pasted "ip/path" works.
+    checkEqual(RTSPTarget.parse("192.168.1.20/audio")?.uri, "rtsp://192.168.1.20/audio",
+               "bare host/path defaults to rtsp://")
+}
+
+// MARK: - RTSP messages
+
+print("\nRTSPMessage")
+do {
+    let sdp = "v=0\r\nm=audio 0 RTP/AVP 97\r\n"
+    let raw = "RTSP/1.0 200 OK\r\n" +
+              "CSeq: 3\r\n" +
+              "Content-Base: rtsp://cam.local/audio/\r\n" +
+              "Content-Type: application/sdp\r\n" +
+              "Content-Length: \(sdp.utf8.count)\r\n" +
+              "\r\n" + sdp
+    var buffer = Data(raw.utf8)
+    // A media frame that arrived in the same read must survive the parse.
+    buffer.append(Data([0x24, 0x00, 0x00, 0x02, 0xAA, 0xBB]))
+
+    let parsed = RTSPResponse.parse(buffer)
+    check(parsed != nil, "parses a complete response")
+    checkEqual(parsed?.response.statusCode, 200, "status code")
+    checkEqual(parsed?.response.reasonPhrase, "OK", "reason phrase")
+    checkEqual(parsed?.response.cseq, 3, "CSeq")
+    checkEqual(parsed?.response.contentBase, "rtsp://cam.local/audio/", "Content-Base")
+    checkEqual(parsed?.response.body, Data(sdp.utf8), "body honours Content-Length")
+    checkEqual(parsed?.consumed, raw.utf8.count,
+               "consumes exactly the message, leaving the interleaved frame")
+
+    // Short reads are the normal case on a socket: report incomplete, not broken.
+    check(RTSPResponse.parse(Data("RTSP/1.0 200 OK\r\nCSeq: 3\r\n".utf8)) == nil,
+          "incomplete headers parse as nil")
+    let truncated = "RTSP/1.0 200 OK\r\nContent-Length: 10\r\n\r\nshort"
+    check(RTSPResponse.parse(Data(truncated.utf8)) == nil,
+          "a body still arriving parses as nil")
+    check(RTSPResponse.parse(Data("$\u{0}\u{0}\u{2}ab".utf8)) == nil,
+          "a media frame is not mistaken for a response")
+
+    let setup = "RTSP/1.0 200 OK\r\nCSeq: 4\r\n" +
+                "Session: 4ee1a2f;timeout=45\r\n" +
+                "Transport: RTP/AVP/TCP;unicast;interleaved=2-3\r\n\r\n"
+    let setupResponse = RTSPResponse.parse(Data(setup.utf8))?.response
+    checkEqual(setupResponse?.sessionID, "4ee1a2f", "session id without the timeout")
+    checkEqual(setupResponse?.sessionTimeout, 45, "session timeout")
+    checkEqual(setupResponse?.interleavedRTPChannel, 2,
+               "honours the server's channel numbering, not ours")
+
+    // Request encoding: CSeq, Session and Authorization all have to be present.
+    let request = RTSPRequest(method: "PLAY", uri: "rtsp://cam.local/audio",
+                              cseq: 5, session: "4ee1a2f",
+                              authorization: "Digest x", extraHeaders: [
+                                (name: "Range", value: "npt=0.000-")
+                              ])
+    let encoded = String(data: request.encode(userAgent: "IntercomListener"), encoding: .utf8) ?? ""
+    check(encoded.hasPrefix("PLAY rtsp://cam.local/audio RTSP/1.0\r\n"), "request line")
+    check(encoded.contains("CSeq: 5\r\n"), "encodes CSeq")
+    check(encoded.contains("Session: 4ee1a2f\r\n"), "encodes Session")
+    check(encoded.contains("Authorization: Digest x\r\n"), "encodes Authorization")
+    check(encoded.contains("Range: npt=0.000-\r\n"), "encodes extra headers")
+    check(encoded.hasSuffix("\r\n\r\n"), "terminates the header block")
+}
+
+// MARK: - RTSP authentication
+
+print("\nRTSPAuthChallenge")
+do {
+    // Both schemes on one 401 — digest has to win, which is why the response
+    // keeps its header fields as a list rather than a dictionary.
+    let headers = ["Basic realm=\"cam\"",
+                   "Digest realm=\"testrealm@host.com\", qop=\"auth,auth-int\", " +
+                   "nonce=\"dcd98b7102dd2f0e8b11d0f600bfb0c093\", " +
+                   "opaque=\"5ccc069c403ebaf9f0171e9517f40e41\""]
+    let challenge = RTSPAuthChallenge.best(from: headers)
+    checkEqual(challenge?.scheme, .digest, "prefers digest over basic")
+    checkEqual(challenge?.realm, "testrealm@host.com", "realm")
+    checkEqual(challenge?.qop, ["auth", "auth-int"], "qop list survives the quoted comma")
+    checkEqual(challenge?.isSupported, true, "MD5 digest is supported")
+
+    // RFC 2617 §3.5 test vector — proves the whole HA1/HA2/qop chain.
+    let credentials = StreamCredentials(username: "Mufasa", password: "Circle Of Life")
+    let header = challenge?.authorization(method: "GET",
+                                         uri: "/dir/index.html",
+                                         credentials: credentials,
+                                         cnonce: "0a4f113b",
+                                         nonceCount: 1) ?? ""
+    check(header.contains("response=\"6629fae49393a05397450978507c4ef1\""),
+          "digest response matches the RFC 2617 vector")
+    check(header.contains("nc=00000001"), "nonce count is 8 hex digits")
+    check(header.contains("qop=auth"), "qop echoed back")
+    check(header.contains("opaque=\"5ccc069c403ebaf9f0171e9517f40e41\""), "opaque echoed back")
+
+    // Legacy (RFC 2069) servers send no qop; the answer must not invent one.
+    let legacy = RTSPAuthChallenge.parse("Digest realm=\"cam\", nonce=\"abc\"")
+    let legacyHeader = legacy?.authorization(method: "DESCRIBE", uri: "rtsp://cam/x",
+                                             credentials: credentials,
+                                             cnonce: "0a4f113b", nonceCount: 1) ?? ""
+    check(!legacyHeader.contains("qop"), "no qop when the server offered none")
+    check(!legacyHeader.contains("nc="), "no nonce count without qop")
+
+    let basic = RTSPAuthChallenge.parse("Basic realm=\"cam\"")?
+        .authorization(method: "DESCRIBE", uri: "rtsp://cam/x",
+                       credentials: StreamCredentials(username: "u", password: "p"),
+                       cnonce: "x", nonceCount: 1)
+    checkEqual(basic, "Basic " + Data("u:p".utf8).base64EncodedString(), "basic header")
+
+    // A challenge we can't answer must be reported, not answered wrongly — a
+    // wrong answer is indistinguishable from a wrong password.
+    checkEqual(RTSPAuthChallenge.parse("Digest realm=\"c\", nonce=\"n\", algorithm=SHA-256")?
+        .isSupported, false, "SHA-256 digest is refused")
+    check(RTSPAuthChallenge.parse("Digest realm=\"c\"") == nil, "digest without a nonce is unusable")
+    check(RTSPAuthChallenge.parse("Negotiate abc") == nil, "unknown scheme")
+}
+
+// MARK: - RTSP SDP / audio track selection
+
+print("\nRTSPSDP")
+do {
+    let cameraSDP = """
+    v=0\r
+    o=- 0 0 IN IP4 192.168.1.20\r
+    s=Media Presentation\r
+    a=control:*\r
+    m=video 0 RTP/AVP 96\r
+    a=control:trackID=0\r
+    a=rtpmap:96 H264/90000\r
+    m=audio 0 RTP/AVP 97\r
+    a=control:trackID=1\r
+    a=rtpmap:97 mpeg4-generic/16000/1\r
+    a=fmtp:97 streamtype=5;profile-level-id=1;mode=AAC-hbr;sizelength=13;\
+    indexlength=3;indexdeltalength=3;config=1408\r
+    """
+    let aac = RTSPSDP.audioTrack(from: cameraSDP)
+    checkEqual(aac?.payloadType, 97, "picks the audio m-section, not the video one")
+    checkEqual(aac?.encoding, .aacLC, "recognises mpeg4-generic AAC-LC")
+    checkEqual(aac?.sampleRate, 16_000, "AAC sample rate")
+    checkEqual(aac?.sourceChannels, 1, "AAC channel count")
+    checkEqual(aac?.control, "trackID=1", "audio track control")
+    checkEqual(aac?.auSizeLength, 13, "AU size length from fmtp")
+
+    // G.711 needs no rtpmap at all — payload type 0 is defined by RFC 3551.
+    let g711 = RTSPSDP.audioTrack(from: "m=audio 0 RTP/AVP 0\r\na=control:trackID=1\r\n")
+    checkEqual(g711?.encoding, .pcmu, "static payload type 0 is µ-law")
+    checkEqual(g711?.sampleRate, 8_000, "µ-law is 8 kHz")
+
+    let l16 = RTSPSDP.audioTrack(from: "m=audio 0 RTP/AVP 10\r\n")
+    checkEqual(l16?.encoding, .l16, "static payload type 10 is L16")
+    checkEqual(l16?.sourceChannels, 2, "payload type 10 is stereo")
+
+    // Several audio formats offered: pick one we can actually play.
+    let mixed = "m=audio 0 RTP/AVP 96 8\r\n" +
+                "a=rtpmap:96 MP4A-LATM/44100/2\r\n" +
+                "a=rtpmap:8 PCMA/8000\r\n"
+    checkEqual(RTSPSDP.audioTrack(from: mixed)?.encoding, .pcma,
+               "skips LATM in favour of a playable format")
+
+    // Nothing playable: still report the track so the UI can name the codec.
+    let latmOnly = RTSPSDP.audioTrack(from: "m=audio 0 RTP/AVP 96\r\n" +
+                                            "a=rtpmap:96 MP4A-LATM/44100/2\r\n")
+    checkEqual(latmOnly?.encoding, .unsupported("MP4A-LATM"), "names an unplayable codec")
+    checkEqual(latmOnly?.encoding.isSupported, false, "unplayable codec is not supported")
+
+    check(RTSPSDP.audioTrack(from: "m=video 0 RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\n") == nil,
+          "a video-only stream has no audio track")
+
+    // HE-AAC decodes through a path we don't have, so it must be refused up front.
+    let heAAC = "m=audio 0 RTP/AVP 97\r\na=rtpmap:97 mpeg4-generic/32000/2\r\n" +
+                "a=fmtp:97 mode=AAC-hbr;config=2B0A08\r\n"
+    checkEqual(RTSPSDP.audioTrack(from: heAAC)?.encoding.isSupported, false,
+               "HE-AAC is refused rather than played as noise")
+
+    // Control URL resolution (RFC 2326 §C.1.1).
+    checkEqual(RTSPSDP.resolveControl("trackID=1",
+                                      requestURI: "rtsp://cam/audio",
+                                      contentBase: "rtsp://cam/audio/"),
+               "rtsp://cam/audio/trackID=1", "relative control against Content-Base")
+    checkEqual(RTSPSDP.resolveControl("trackID=1",
+                                      requestURI: "rtsp://cam/audio",
+                                      contentBase: nil),
+               "rtsp://cam/audio/trackID=1", "relative control against the request URI")
+    checkEqual(RTSPSDP.resolveControl("rtsp://cam/other",
+                                      requestURI: "rtsp://cam/audio",
+                                      contentBase: nil),
+               "rtsp://cam/other", "absolute control wins")
+    checkEqual(RTSPSDP.resolveControl("*",
+                                      requestURI: "rtsp://cam/audio",
+                                      contentBase: nil),
+               "rtsp://cam/audio", "aggregate control")
+}
+
+// MARK: - AAC decoder configuration
+
+print("\nAACConfig")
+do {
+    // "1408" is the canonical AAC-LC / 16 kHz / mono AudioSpecificConfig.
+    let mono = AACConfig.parse(hex: "1408")
+    checkEqual(mono?.objectType, 2, "AAC-LC object type")
+    checkEqual(mono?.sampleRate, 16_000, "sample rate from the frequency index")
+    checkEqual(mono?.channels, 1, "channel configuration")
+    checkEqual(mono?.framesPerPacket, 1_024, "AAC-LC frame length")
+    checkEqual(mono?.isLowComplexity, true, "AAC-LC is decodable")
+
+    let stereo = AACConfig.parse(hex: "1210")
+    checkEqual(stereo?.sampleRate, 44_100, "44.1 kHz frequency index")
+    checkEqual(stereo?.channels, 2, "stereo channel configuration")
+
+    check(AACConfig.parse(hex: "14") == nil, "rejects a truncated config")
+    check(AACConfig.parse(hex: "zz") == nil, "rejects non-hex")
+    check(AACConfig.parse(hex: "140") == nil, "rejects an odd-length config")
+}
+
+// MARK: - RTSP payload unpacking
+
+print("\nRTSPAudioPayload")
+do {
+    // G.711 encodes zero as 0xFF (µ-law) and 0xD5 (A-law).
+    let ulawSilence = RTSPAudioPayload.decodeULaw(Data([0xFF, 0xFF]))
+    checkEqual(ulawSilence.count, 4, "µ-law expands 1 byte to 1 sample")
+    checkEqual([UInt8](ulawSilence), [0, 0, 0, 0], "µ-law 0xFF is silence")
+
+    // Full-scale negative: the loudest µ-law codepoint.
+    let ulawLoud = RTSPAudioPayload.decodeULaw(Data([0x00]))
+    let loudSample = Int16(bitPattern: UInt16([UInt8](ulawLoud)[0]) |
+                                      UInt16([UInt8](ulawLoud)[1]) << 8)
+    checkEqual(loudSample, -32_124, "µ-law 0x00 is full-scale negative")
+
+    let alawSilence = RTSPAudioPayload.decodeALaw(Data([0xD5]))
+    let alawSample = Int16(bitPattern: UInt16([UInt8](alawSilence)[0]) |
+                                       UInt16([UInt8](alawSilence)[1]) << 8)
+    check(abs(Int(alawSample)) <= 8, "A-law 0xD5 is (near) silence")
+    checkEqual(RTSPAudioPayload.decodeALaw(Data(count: 160)).count, 320,
+               "A-law expands 1 byte to 1 sample")
+
+    // Stereo downmix: 16-bit average, in place of a converter channel map.
+    // Frame 1 = (1000, 3000) → 2000; frame 2 = (-1000, -3000) → -2000.
+    var stereo = Data()
+    for sample in [Int16(1_000), 3_000, -1_000, -3_000] {
+        let bits = UInt16(bitPattern: sample)
+        stereo.append(UInt8(bits & 0xFF)); stereo.append(UInt8(bits >> 8))
+    }
+    let mono = RTSPAudioPayload.downmixToMono(stereo, channels: 2)
+    checkEqual(mono.count, 4, "two stereo frames become two mono samples")
+    let monoBytes = [UInt8](mono)
+    checkEqual(Int16(bitPattern: UInt16(monoBytes[0]) | UInt16(monoBytes[1]) << 8),
+               2_000, "averages the two channels")
+    checkEqual(Int16(bitPattern: UInt16(monoBytes[2]) | UInt16(monoBytes[3]) << 8),
+               -2_000, "averages negative samples")
+    checkEqual(RTSPAudioPayload.downmixToMono(stereo, channels: 1), stereo,
+               "mono passes through untouched")
+
+    // RFC 3640 AU headers: one 20-byte access unit (13-bit size + 3-bit index).
+    let single = Data([0x00, 0x10, 0x00, 0xA0]) + Data(repeating: 0x5A, count: 20)
+    let units = RTSPAudioPayload.accessUnits(from: single, sizeLength: 13,
+                                             indexLength: 3, indexDeltaLength: 3)
+    checkEqual(units.count, 1, "one access unit")
+    checkEqual(units.first?.count, 20, "access-unit size from the AU header")
+
+    // Two AUs in one packet: a multi-AU payload mis-split as one decodes to noise.
+    let multi = Data([0x00, 0x20, 0x00, 0x50, 0x00, 0x60])
+        + Data(repeating: 0x01, count: 10) + Data(repeating: 0x02, count: 12)
+    let multiUnits = RTSPAudioPayload.accessUnits(from: multi, sizeLength: 13,
+                                                  indexLength: 3, indexDeltaLength: 3)
+    checkEqual(multiUnits.count, 2, "splits a two-AU payload")
+    checkEqual(multiUnits.first?.count, 10, "first AU size")
+    checkEqual(multiUnits.last?.count, 12, "second AU size")
+    checkEqual(multiUnits.last?.first, 0x02, "second AU starts after the first")
+
+    // sizelength=0 means the payload is a single AU with no header block at all.
+    let bare = Data(repeating: 0x7F, count: 8)
+    checkEqual(RTSPAudioPayload.accessUnits(from: bare, sizeLength: 0,
+                                            indexLength: 0, indexDeltaLength: 0),
+               [bare], "no AU headers means one access unit")
+}
+
+// MARK: - RTP over RTSP
+
+print("\nRTSPStreamSession RTP")
+do {
+    func rtpPacket(payloadType: UInt8, marker: Bool = false,
+                   csrcCount: UInt8 = 0, padding: [UInt8] = [],
+                   payload: [UInt8]) -> Data {
+        var packet = Data([0x80 | (padding.isEmpty ? 0 : 0x20) | csrcCount,
+                           marker ? payloadType | 0x80 : payloadType,
+                           0x12, 0x34,                      // sequence
+                           0x00, 0x00, 0x10, 0x00,          // timestamp
+                           0xDE, 0xAD, 0xBE, 0xEF])         // ssrc
+        packet.append(Data(repeating: 0, count: Int(csrcCount) * 4))
+        packet.append(Data(payload))
+        packet.append(Data(padding))
+        return packet
+    }
+
+    let parsed = RTSPStreamSession.parseRTPPacket(
+        rtpPacket(payloadType: 97, marker: true, payload: [1, 2, 3, 4]))
+    checkEqual(parsed?.payloadType, 97, "payload type")
+    checkEqual(parsed?.marker, true, "marker bit")
+    checkEqual(parsed?.sequence, 0x1234, "sequence number")
+    checkEqual(parsed?.timestamp, 0x1000, "timestamp")
+    checkEqual(parsed?.payload, Data([1, 2, 3, 4]), "payload")
+
+    checkEqual(RTSPStreamSession.parseRTPPacket(
+        rtpPacket(payloadType: 0, csrcCount: 2, payload: [9, 9]))?.payload,
+        Data([9, 9]), "skips the CSRC list")
+
+    // Padding is counted in the last byte and must not reach the speaker.
+    checkEqual(RTSPStreamSession.parseRTPPacket(
+        rtpPacket(payloadType: 8, padding: [0, 0, 3], payload: [7]))?.payload,
+        Data([7]), "strips RTP padding")
+
+    check(RTSPStreamSession.parseRTPPacket(Data([0x80, 0x61, 0x00])) == nil,
+          "rejects a runt packet")
+    var wrongVersion = rtpPacket(payloadType: 97, payload: [1])
+    wrongVersion[0] = 0x40
+    check(RTSPStreamSession.parseRTPPacket(wrongVersion) == nil, "rejects RTP version 1")
+}
+
+// MARK: - Stream entries in the roster
+
+print("\nRTSP roster entries")
+do {
+    let stream = IntercomDevice(name: "Nursery Camera",
+                               host: "192.168.1.20",
+                               port: 554,
+                               protocolKind: .rtsp,
+                               streamURL: "rtsp://192.168.1.20/audio")
+    check(stream.isAudioStream, "an rtsp device is an audio stream")
+    check(stream.isListenOnly, "an audio stream is listen-only")
+
+    // Round-trips through the persisted roster, URL included.
+    let encoded = try JSONEncoder().encode([stream])
+    let decoded = try JSONDecoder().decode([IntercomDevice].self, from: encoded)
+    checkEqual(decoded.first?.streamURL, "rtsp://192.168.1.20/audio", "streamURL persists")
+    checkEqual(decoded.first?.protocolKind, .rtsp, "protocol persists")
+
+    // A roster written before streams existed must still decode (invariant #12).
+    let old = """
+    [{"id":"\(UUID().uuidString)","name":"Kitchen","host":"192.168.1.42","port":6054}]
+    """
+    let upgraded = try JSONDecoder().decode([IntercomDevice].self, from: Data(old.utf8))
+    checkEqual(upgraded.first?.streamURL, nil, "a pre-stream roster decodes with no URL")
+    check(upgraded.first?.isAudioStream == false, "and is not treated as a stream")
+
+    // Discovery must never adopt a stream: a camera and the panel in the same
+    // room plausibly share a name, and matching them would overwrite the URL.
+    let panel = IntercomDevice(name: "Nursery Camera", host: "192.168.1.51",
+                               protocolKind: .voip)
+    check(!DeviceStore.isSameEndpoint(stream, panel),
+          "a stream never name-matches a discovered panel")
+    check(DeviceStore.isSameEndpoint(stream, stream), "a stream matches itself by id")
+
+    var renamed = panel
+    renamed.host = "192.168.1.99"
+    check(DeviceStore.isSameEndpoint(panel, renamed),
+          "two panels still match by name (unchanged behaviour)")
+}
+
 print("\n\(checks - failures)/\(checks) checks passed")
 if failures > 0 {
     print("\(failures) FAILURE(S)")

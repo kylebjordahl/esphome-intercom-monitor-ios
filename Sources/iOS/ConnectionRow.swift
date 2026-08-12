@@ -34,8 +34,11 @@ struct ConnectionRow: View {
 
             if conn.state == .active {
                 // Push-to-talk: hold to open the mic, release to go silent.
-                PushToTalkButton(isTalking: conn.isTalking) { talking in
-                    session.setTalking(talking, for: conn)
+                // An RTSP monitor is one-way, so it gets no talk control at all.
+                if !conn.isListenOnly {
+                    PushToTalkButton(isTalking: conn.isTalking) { talking in
+                        session.setTalking(talking, for: conn)
+                    }
                 }
 
                 HStack(spacing: 16) {
@@ -81,7 +84,7 @@ struct ConnectionRow: View {
         case .idle:            return "Connected (idle)"
         case .outgoing:        return "Calling…"
         case .incoming:        return "Incoming call"
-        case .active:          return "Active"
+        case .active:          return conn.isListenOnly ? "Listening" : "Active"
         case .reconnecting:    return "Reconnecting…"
         case .callFailed(let reason): return Self.callFailedLabel(reason)
         case .error(let e):    return "Error: \(e)"
@@ -89,13 +92,17 @@ struct ConnectionRow: View {
         }
     }
 
+    /// SIP reports a short token for the handful of ways a call can fail; a
+    /// stream reports a whole sentence ("Authentication rejected — check the
+    /// username and password"), which is exactly what the user needs to see.
     private static func callFailedLabel(_ reason: String) -> String {
         switch reason {
         case "busy":             return "Busy"
         case "no answer":        return "No Answer"
         case "declined":         return "Declined"
         case "signaling closed": return "Call Dropped"
-        default:                 return "Call Failed"
+        case "":                 return "Call Failed"
+        default:                 return reason
         }
     }
 

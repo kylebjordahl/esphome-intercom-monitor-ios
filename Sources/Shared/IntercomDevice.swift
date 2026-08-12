@@ -13,14 +13,24 @@ enum DeviceProtocol: String, Codable, Sendable, CaseIterable {
     case legacy
     /// SIP signaling + RTP/UDP L16 media (firmware >= v2026.7.0).
     case voip
+    /// Not an intercom panel at all: a one-way RTSP/RTSPS audio stream (an IP
+    /// camera, a go2rtc/Frigate restream, …) monitored listen-only.  Added by
+    /// URL — there is nothing for Home Assistant to discover.
+    case rtsp
 
     var label: String {
         switch self {
         case .auto:   return "Automatic"
         case .legacy: return "Legacy (≤ 2026.6)"
         case .voip:   return "VoIP (≥ 2026.7)"
+        case .rtsp:   return "RTSP audio stream"
         }
     }
+
+    /// Cases offered for a hand-entered *panel*.  `.rtsp` is deliberately absent:
+    /// a stream is added by URL through its own sheet, not by flipping the
+    /// protocol on an intercom device (it needs a URL, not a host/port).
+    static var panelCases: [DeviceProtocol] { allCases.filter { $0 != .rtsp } }
 }
 
 /// A ring group forks a call to every member in parallel (first to answer wins);
@@ -70,6 +80,14 @@ struct IntercomDevice: Identifiable, Codable, Hashable, Sendable {
     /// only (display); dialing doesn't need it.
     var groupMembers: [String] = []
 
+    // MARK: - RTSP audio stream (protocolKind == .rtsp)
+
+    /// `rtsp://` / `rtsps://` URL of a listen-only audio stream, **without**
+    /// credentials — a username/password pasted as part of the URL is split out
+    /// on save and kept in the Keychain (see `StreamCredentialStore`), because
+    /// the roster itself is persisted in plain UserDefaults.
+    var streamURL: String?
+
     init(id: UUID = UUID(),
          name: String,
          host: String,
@@ -83,7 +101,8 @@ struct IntercomDevice: Identifiable, Codable, Hashable, Sendable {
          rxFormats: [String] = [],
          extensionNumber: String? = nil,
          groupKind: GroupKind? = nil,
-         groupMembers: [String] = []) {
+         groupMembers: [String] = [],
+         streamURL: String? = nil) {
         self.id   = id
         self.name = name
         self.host = host
@@ -98,7 +117,18 @@ struct IntercomDevice: Identifiable, Codable, Hashable, Sendable {
         self.extensionNumber = extensionNumber
         self.groupKind       = groupKind
         self.groupMembers    = groupMembers
+        self.streamURL       = streamURL
     }
+
+    // MARK: - Stream helpers
+
+    /// True for a one-way RTSP audio stream rather than a two-way panel.
+    var isAudioStream: Bool { protocolKind == .rtsp }
+
+    /// Whether this endpoint can only be listened to.  Drives both the UI (no
+    /// push-to-talk control) and the audio engine (a session with no duplex call
+    /// needs no microphone at all — see `AudioEngine.configure(withCapture:)`).
+    var isListenOnly: Bool { isAudioStream }
 
     // MARK: - Negotiation helpers
 
@@ -123,6 +153,7 @@ struct IntercomDevice: Identifiable, Codable, Hashable, Sendable {
         case protocolKind, sipURI, sipPort, sipTransport, rtpPort
         case txFormats, rxFormats, extensionNumber
         case groupKind, groupMembers
+        case streamURL
     }
 
     init(from decoder: Decoder) throws {
@@ -148,6 +179,7 @@ struct IntercomDevice: Identifiable, Codable, Hashable, Sendable {
         extensionNumber = try c.decodeIfPresent(String.self, forKey: .extensionNumber)
         groupKind    = try c.decodeIfPresent(GroupKind.self, forKey: .groupKind)
         groupMembers = try c.decodeIfPresent([String].self, forKey: .groupMembers) ?? []
+        streamURL    = try c.decodeIfPresent(String.self, forKey: .streamURL)
     }
 
     /// UserDefaults key under which the saved roster is persisted.  Shared so the
@@ -488,6 +520,50 @@ extension String {
     var nilIfEmpty: String? { isEmpty ? nil : self }
 }
 
+// MARK: - Stream credentials
+
+/// Username/password for one RTSP stream.
+struct StreamCredentials: Equatable, Sendable {
+    var username: String
+    var password: String
+
+    var isEmpty: Bool { username.isEmpty && password.isEmpty }
+}
+
+/// Keychain storage for RTSP credentials, keyed by device id.
+///
+/// The device roster lives in UserDefaults (it has to: App Intents and the watch
+/// read it without the app's stores), which is the wrong place for a camera
+/// password — so `IntercomDevice.streamURL` keeps the credential-free URL and the
+/// secret lives here instead.  Same generic-password store as the Home Assistant
+/// token; available on iOS and watchOS alike.
+enum StreamCredentialStore {
+    static func key(for id: UUID) -> String { "rtsp_credentials_\(id.uuidString)" }
+
+    static func load(for id: UUID) -> StreamCredentials? {
+        guard let raw = keychainLoad(key: key(for: id)) else { return nil }
+        // Stored as "user\npassword"; a password may legitimately contain
+        // anything except a newline, so split only on the first one.
+        let parts = raw.split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: false)
+        let credentials = StreamCredentials(username: String(parts.first ?? ""),
+                                            password: parts.count > 1 ? String(parts[1]) : "")
+        return credentials.isEmpty ? nil : credentials
+    }
+
+    static func save(_ credentials: StreamCredentials?, for id: UUID) {
+        guard let credentials, !credentials.isEmpty else {
+            delete(for: id)
+            return
+        }
+        keychainSave(key: key(for: id),
+                     value: "\(credentials.username)\n\(credentials.password)")
+    }
+
+    static func delete(for id: UUID) {
+        keychainDelete(key: key(for: id))
+    }
+}
+
 // MARK: - Stable identifiers
 
 extension UUID {
@@ -561,6 +637,8 @@ final class DeviceStore: ObservableObject {
 
     func remove(id: UUID) {
         devices.removeAll { $0.id == id }
+        // Don't leave an orphaned camera password behind in the Keychain.
+        StreamCredentialStore.delete(for: id)
         save()
     }
 
@@ -641,10 +719,17 @@ final class DeviceStore: ObservableObject {
     }
 
     /// Identity match used for de-duplication: same stable id, or same name.
+    ///
+    /// A hand-added RTSP stream only ever matches by id.  Home Assistant never
+    /// discovers one, so name-matching a stream against a discovered panel could
+    /// only ever be a false positive — and it would overwrite the stream entry's
+    /// protocol and address with the panel's, silently destroying it (a camera
+    /// and the panel in the same room very plausibly share a name).
     nonisolated static func isSameEndpoint(_ a: IntercomDevice, _ b: IntercomDevice) -> Bool {
-        a.id == b.id
-            || a.name.compare(b.name, options: [.caseInsensitive, .diacriticInsensitive])
-                == .orderedSame
+        if a.id == b.id { return true }
+        guard !a.isAudioStream, !b.isAudioStream else { return false }
+        return a.name.compare(b.name, options: [.caseInsensitive, .diacriticInsensitive])
+            == .orderedSame
     }
 
     private func load() {

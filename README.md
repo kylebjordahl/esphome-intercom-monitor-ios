@@ -16,6 +16,7 @@ The original motivation was a **nursery monitor**: open a listen-only audio stre
 - **Incoming calls** — the app runs a TCP listener and advertises itself over mDNS, so panels can call *it*. Incoming calls surface as a full-screen answer/decline sheet.
 - **Live Activity** — an active call shows on the Lock Screen and Dynamic Island with a live timer; a single call gets a tap-to-talk button right in the activity.
 - **Home Assistant auto-discovery** — pulls the panel list from an HA phonebook/endpoint sensor over REST + WebSocket, and re-discovers periodically without disturbing live calls.
+- **RTSP audio monitors** — add an `rtsp://` / `rtsps://` stream (an IP camera, a go2rtc/Frigate restream) **by URL** and listen to it exactly like a panel: same background audio, same Live Activity, same per-call volume. Audio only — no video track is ever requested — and listen-only, so a stream-only session never asks for the microphone. See [Monitoring an RTSP audio stream](#monitoring-an-rtsp-audio-stream).
 - **Per-call controls** — speaker mute, per-call volume, and individual hang-up.
 
 ---
@@ -72,7 +73,60 @@ The client looks for panels in two ways (in order):
 
 It then keeps the list live via the HA WebSocket API and re-polls every 60 s. Discovery only ever *adds* devices — it never removes one or touches a live call.
 
-**No Home Assistant?** Add panels manually in the Devices tab (＋ button) with a name, IP, and port (default `6054`).
+**No Home Assistant?** Add panels manually in the Devices tab (＋ button → **Intercom Panel**) with a name, IP, and port (default `6054`).
+
+---
+
+## Monitoring an RTSP audio stream
+
+An intercom panel isn't the only thing worth listening to. Any RTSP source with an
+audio track — a nursery camera, a doorbell, a go2rtc/Frigate restream — can be
+added as a **listen-only monitor** that behaves like any other entry in the roster.
+
+Nothing discovers these (Home Assistant has no idea what a camera's RTSP endpoint
+is), so they are added by URL: Devices tab → **＋** → **Audio Stream by URL**.
+
+| Field | Notes |
+|---|---|
+| **Name** | What shows in the roster, the Live Activity, and Siri ("listen in on Nursery Camera"). |
+| **URL** | `rtsp://host[:port]/path` or `rtsps://…`. Default ports 554 / 322. A `user:pass@` in the URL is accepted and moved to the Keychain on save. |
+| **Username / Password** | Optional; stored in the **Keychain**, never in the device roster. |
+
+Then select it and tap **Listen**.
+
+**What it does**
+
+- **Audio only.** Only the audio `m=` section of the SDP is `SETUP`, so the camera
+  sends no video at all — a video track is typically 100× the bitrate and would
+  cost battery and Wi-Fi for pixels nobody is looking at.
+- **Media rides the signaling socket** (`Transport: RTP/AVP/TCP;interleaved=0-1`).
+  One TCP connection means no second port to open, in-order delivery (no jitter
+  buffer needed), and it works identically under TLS.
+- **No microphone.** With nothing but streams active, the audio session runs in
+  `.playback` instead of `.playAndRecord`: iOS never prompts for mic access and
+  shows no recording indicator. Start a real panel call alongside a monitor and
+  the engine upgrades itself to full duplex (prompting then, if needed).
+- **Reconnects on its own.** Once a stream has played, a dropped connection is
+  retried indefinitely with capped backoff — a monitor is expected to survive a
+  Wi-Fi blip overnight. A stream that never played (wrong URL, wrong password,
+  unsupported codec) fails after a few attempts and says why on the row.
+- **Authentication:** HTTP Digest (MD5) and Basic, which is what cameras ship.
+- **Keepalive:** `OPTIONS` with the `Session` header at half the server's
+  advertised session timeout.
+
+**Supported stream audio codecs**
+
+| Codec | Notes |
+|---|---|
+| G.711 µ-law / A-law (`PCMU`, `PCMA`) | Payload types 0 / 8 or via `rtpmap`. Resampled to 16 kHz. |
+| L16 (`L16`) | Big-endian PCM, any rate, mono or stereo. |
+| AAC-LC (`mpeg4-generic`, RFC 3640) | Decoder configured from the `fmtp config=` AudioSpecificConfig. |
+
+Everything is decoded, downmixed to mono, and resampled to the 16 kHz mono S16
+that `AudioEngine` plays. **HE-AAC (SBR/PS), MP4A-LATM, Opus and G.726 are
+refused** with the codec named on the row rather than played as noise. If your
+camera only offers one of those, put [go2rtc](https://github.com/AlexxIT/go2rtc)
+or Frigate in front of it and expose a G.711 or AAC-LC audio track.
 
 ---
 
@@ -108,7 +162,7 @@ It then keeps the list live via the HA WebSocket API and re-polls every 60 s. Di
 ```
 
 - **`IntercomSession`** is the brain. It owns the list of live `IntercomConnection`s, drives the shared `AudioEngine`, runs the `IntercomServer` for inbound calls, and reconciles the Live Activity.
-- **`IntercomConnection`** wraps one TCP socket — either outbound (we called a panel) or inbound (a panel called us) — and implements the call state machine and the wire protocol.
+- **`IntercomConnection`** wraps one TCP socket — either outbound (we called a panel) or inbound (a panel called us) — and implements the call state machine and the wire protocol. It is also the facade over the other two media sources: a `SIPCall` for VoIP panels and an `RTSPStreamSession` for a monitored audio stream. Everything above it (views, watch app, Live Activity intents) sees one interface regardless.
 - **`AudioEngine`** is a single `AVAudioEngine` shared across all calls: one input tap (mic → all active calls) and one `AVAudioPlayerNode` per call (panel → speaker), mixed to the output.
 
 ### Audio path
@@ -119,6 +173,16 @@ mic → input tap (HW rate, format: nil) → AVAudioConverter → 16 kHz int16
 
 each call's RX AUDIO frame → AVAudioConverter → 16 kHz float32
     → that call's AVAudioPlayerNode → mainMixer → speaker
+```
+
+A monitored RTSP stream joins that second path, with one extra stage in front —
+the only real format conversion in the app, since both intercom protocols already
+speak 16 kHz mono S16:
+
+```
+interleaved RTP frame → RTP header strip → G.711 / L16 / AAC-LC decode
+    → downmix to mono → resample to 16 kHz → 512-sample frames
+    → that monitor's AVAudioPlayerNode → mainMixer → speaker
 ```
 
 ### Call flow
@@ -167,6 +231,47 @@ Strings are length-prefixed: `[len: u8][utf8 bytes]`.
 2. **`AUDIO` frames must be exactly 1024 bytes.** Larger or irregular frames overflow the panel's receive buffer and it resets the connection. The mic capture is re-framed into precise 1024-byte chunks before sending. (See `AudioEngine.convertAndForward`.)
 3. **A socket drop without `HANGUP`/`DECLINE` is treated as unexpected, not a real call end.** Wi-Fi blips, NAT timeouts, and ESP reboots can close the TCP connection without either side sending a teardown message. For connections we dialed out (client-side), that's recovered automatically: the connection moves to `.reconnecting` and retries with exponential backoff (up to 5 attempts), redialing once the socket is back. A deliberate hangup/decline — sent or received — skips this and tears the connection down immediately. Server-side connections (a panel called us) can't be redialed by the phone, so an unexpected drop there just ends the call; the panel has to call back. (See `IntercomConnection.handleUnexpectedDrop`.)
 
+### RTSP monitoring (RFC 2326 / 3550 / 3640)
+
+A monitor is a client-side RTSP session and nothing else — no listener, no inbound
+path, nothing to answer:
+
+```
+DESCRIBE  rtsp://cam/audio           Accept: application/sdp
+          ◄──── 401 + WWW-Authenticate      → retry with Digest/Basic
+          ◄──── 200 + SDP                   → pick the audio m= section only
+SETUP     <a=control URL>            Transport: RTP/AVP/TCP;unicast;interleaved=0-1
+          ◄──── 200 + Session: id;timeout=  → note the server's channel numbers
+PLAY      <Content-Base>             Range: npt=0.000-
+          ◄──── 200                         → media starts, row goes "Listening"
+OPTIONS   (every timeout/2, with Session)   → keepalive
+TEARDOWN  on stop                           → camera frees the session slot
+```
+
+Media then arrives on the same socket, interleaved with any further responses:
+
+```
+┌──────┬─────────┬───────────────┬──────────────────┐
+│ '$'  │ channel │ length        │ RTP packet       │
+│ 0x24 │ u8      │ u16 (BE)      │ <length> bytes   │
+└──────┴─────────┴───────────────┴──────────────────┘
+```
+
+Non-obvious behaviours here:
+
+1. **Only the negotiated payload type is played.** A stray telephone-event or
+   comfort-noise packet rendered as PCM is a burst of noise, not a click.
+2. **Multi-AU AAC packets are split properly.** The RFC 3640 AU-header block is
+   parsed (`sizelength`/`indexlength` from `fmtp`) rather than assuming one access
+   unit per packet, which would decode to garbage on servers that bundle.
+3. **`rtsps://` accepts the server certificate.** LAN cameras serve self-signed
+   certs for an IP address, so default trust evaluation can never pass; TLS is
+   still doing the useful job (the password and audio aren't in the clear), but the
+   peer's *identity* is not verified. Documented, deliberate, and the only way
+   `rtsps://` works at all on a home network.
+4. **Recovery is asymmetric on purpose** — see
+   [Monitoring an RTSP audio stream](#monitoring-an-rtsp-audio-stream).
+
 ---
 
 ## Project layout
@@ -178,6 +283,10 @@ Sources/
     AudioEngine.swift               The hardened AVAudioEngine — mic↔speaker, 16 kHz PCM
     IntercomProtocol.swift          Wire encode/decode + message factories
     IntercomConnection.swift        One TCP call: state machine, keepalive, PTT gating
+    RTSPMessage.swift               RTSP requests/responses + Digest/Basic auth
+    RTSPAudioFormat.swift           SDP audio-track pick, G.711/L16/AAC unpacking
+    RTSPStreamSession.swift         One monitored stream: DESCRIBE/SETUP/PLAY, RTP, retry
+    RTSPAudioDecoder.swift          Stream audio → 16 kHz mono S16 (decode + resample)
     IntercomDevice.swift            Device model + DeviceStore (UserDefaults persistence)
     HomeAssistantClient.swift       REST + WebSocket discovery, Keychain helpers
     NetworkInfo.swift               Local Wi-Fi IPv4 lookup (for endpoint registration)
@@ -226,6 +335,11 @@ session category (no `.defaultToSpeaker` on watchOS).
 - **Background recovery isn't guaranteed.** The audio engine auto-recovers from interruptions and unexpected stops via a watchdog while the app is alive. But if audio stops while the app is backgrounded, iOS may suspend the app (no audio = no background-audio entitlement to stay alive), freezing recovery until you foreground it. This is an inherent iOS background-audio constraint.
 - **No CallKit / APNs.** Incoming calls only arrive while the app is running (foreground or background-audio alive); there's no push-driven wake-up. Live Activity updates are local-only (no push).
 - **TCP only.** UDP transport from the firmware is not implemented.
+- **RTSP monitors are listen-only** — RTSP has no return path here, so there is no push-to-talk for a stream (the control is hidden, in the app, on the watch, and in the Live Activity). Two-way audio on a camera is a per-vendor protocol, not RTSP.
+- **RTSP codec coverage is deliberately narrow** — G.711, L16 and AAC-LC. HE-AAC, LATM, Opus and G.726 are reported as unsupported rather than half-decoded; restream through go2rtc/Frigate if your camera only offers those.
+- **RTSP media is TCP-interleaved only.** A server that refuses `RTP/AVP/TCP` and insists on UDP is reported as unsupported rather than silently connecting with no audio.
+- **`rtsps://` does not verify the server certificate** (see the protocol notes). It protects the credentials and audio on the wire; it does not authenticate the camera.
+- **Stream credentials don't reach the watch.** The roster syncs to watchOS but the Keychain doesn't, so a stream that needs authentication only plays on the phone.
 
 ---
 
@@ -240,6 +354,10 @@ session category (no `.defaultToSpeaker` on watchOS).
 | Stream dies and won't recover ("engine stopped") | The engine self-heals via a watchdog + start-retry + session re-activation (`AudioEngine`). If it stopped while backgrounded, iOS may have suspended the app — foregrounding it triggers recovery. |
 | Live Activity stuck on the Lock Screen | Left over from a crash/force-quit. It's ended automatically on next launch (`CallActivityController.endOrphaned`) and marked stale after a few minutes so iOS can retire it. |
 | No devices discovered | Check the HA URL/token, and that `sensor.intercom_phonebook` (or `*_intercom_endpoint`) exists in HA. Or add devices manually. |
+| Stream row says *"Authentication rejected"* | Wrong username/password, or the camera wants a scheme we don't answer (only Digest-MD5 and Basic). Re-enter the credentials in the stream's Edit sheet. |
+| Stream row names a codec | That codec isn't decodable here (e.g. `HE-AAC`, `MP4A-LATM`). Restream through go2rtc/Frigate with a G.711 or AAC-LC audio track. |
+| Stream row says *"Stream has no audio track"* | The URL points at a video-only substream. Most cameras have a separate path/channel with audio, or audio only on the main stream. |
+| Stream connects but there's no sound | Check the speaker isn't muted for that row, and that the camera's microphone is enabled — an audio track can be present and silent. |
 
 ---
 

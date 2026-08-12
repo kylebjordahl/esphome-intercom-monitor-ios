@@ -27,7 +27,8 @@ final class CallActivityController {
     /// Single entry point: reconcile the Live Activity with the current call
     /// state.  Starts it on the first active call, updates it as things change,
     /// and ends it when no calls remain active.
-    func sync(activeCount: Int, primaryName: String, primaryId: String, isTalking: Bool) {
+    func sync(activeCount: Int, primaryName: String, primaryId: String,
+              isTalking: Bool, isListenOnly: Bool = false) {
         guard ActivityAuthorizationInfo().areActivitiesEnabled else { return }
 
         guard activeCount > 0 else {
@@ -42,7 +43,8 @@ final class CallActivityController {
             primaryName: primaryName.isEmpty ? "Intercom" : primaryName,
             primaryId: primaryId,
             isTalking: isTalking,
-            startedAt: startedAt
+            startedAt: startedAt,
+            isListenOnly: isListenOnly
         )
         let content = ActivityContent(state: state,
                                       staleDate: Date().addingTimeInterval(staleAfter))

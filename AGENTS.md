@@ -18,7 +18,13 @@ in v2026.7.0 rather than re-encoding it:
 | ≥ v2026.7.0 | `voip-pcm/1` | SIP/SDP, UDP or TCP 5060 | RTP/UDP, L16 = S16 **big-endian**, framed to negotiated `a=ptime` |
 
 Both are 16-bit linear PCM, so the conversion between them is a byte swap plus
-re-framing — there is no lossy transcode anywhere in this app.
+re-framing — there is no lossy transcode between the two intercom protocols.
+
+**A third, non-intercom source exists:** an `rtsp://`/`rtsps://` **audio stream**
+(IP camera, go2rtc/Frigate restream) monitored listen-only, added by URL because
+nothing discovers it. This is the one path that does a real format conversion —
+a camera streams G.711/L16/AAC-LC at its own rate, so `RTSPAudioDecoder` decodes,
+downmixes and resamples to the 16 kHz mono S16 that `AudioEngine` requires.
 
 ## Build & run
 
@@ -44,9 +50,11 @@ Wire-protocol checks (no device or simulator needed — compiles the real
 sh Tests/run-protocol-tests.sh
 ```
 
-Run these after touching anything under the SIP/SDP/RTP or device-parsing code;
-they cover format tokens, SIP framing, SDP negotiation, roster parsing, the L16
-byte swap, and `IntercomDevice` upgrade-decoding.
+Run these after touching anything under the SIP/SDP/RTP, RTSP or device-parsing
+code; they cover format tokens, SIP framing, SDP negotiation, roster parsing, the
+L16 byte swap, `IntercomDevice` upgrade-decoding, and — for the monitoring path —
+RTSP URL/message/digest handling, audio-track selection, the AAC config and AU
+headers, G.711 expansion, and RTP parsing.
 
 - **Run the `IntercomListener` scheme, never `IntercomWidgets`** (the latter is a
   Live-Activity-only extension and can't be launched standalone).
@@ -64,11 +72,12 @@ Activity). `HomeAssistantClient` discovers devices into `DeviceStore`.
 `Sources/Shared` compiles into both platforms; `Sources/LiveActivity` compiles
 into the app **and** the widget (but not watchOS, which has no ActivityKit).
 
-`IntercomConnection` is a **facade over both protocols**. It keeps one public API
-(`connect/call/answer/decline/hangup/sendAudio` + `state`), switching internally
-between the inline legacy transport and a `SIPCall`. This is why adding VoIP
-support required no changes to the views, the watch app, or the Live Activity
-intents — keep it that way rather than leaking a protocol enum into the UI.
+`IntercomConnection` is a **facade over all three media sources**. It keeps one
+public API (`connect/call/answer/decline/hangup/sendAudio` + `state`), switching
+internally between the inline legacy transport, a `SIPCall`, and an
+`RTSPStreamSession`. This is why adding VoIP — and later RTSP monitoring —
+required no changes to the views, the watch app, or the Live Activity intents:
+they branch on `conn.isListenOnly`, never on a protocol enum. Keep it that way.
 
 VoIP layer, all in `Sources/Shared`:
 
@@ -78,6 +87,14 @@ VoIP layer, all in `Sources/Shared`:
 - `SIPCall` — one dialog (INVITE/ACK/CANCEL/BYE/OPTIONS).
 - `SIPEndpoint` — listeners on 5060 + Call-ID → dialog routing (`.shared`).
 - `RTPAudioSession` — RTP framing, pacing, and the L16 byte swap.
+
+RTSP monitoring layer, also in `Sources/Shared`:
+
+- `RTSPMessage` — request encoding, response parsing, Digest/Basic auth.
+- `RTSPAudioFormat` — SDP audio-track selection, AAC config, AU headers, G.711.
+- `RTSPStreamSession` — one stream: TCP/TLS socket, DESCRIBE/SETUP/PLAY, the
+  interleaved framing, keepalive, and retry policy.
+- `RTSPAudioDecoder` — decode + downmix + resample to 16 kHz mono S16.
 
 ## Non-obvious invariants — do not regress these
 
@@ -124,7 +141,26 @@ VoIP layer, all in `Sources/Shared`:
     throws on missing keys even when a property has a default, which would wipe
     every saved device on upgrade. Add new fields with `decodeIfPresent` and a
     default; devices saved before VoIP support decode as `.legacy`.
-13. **Live Activity cleanup:** `CallActivityController.endOrphaned()` runs at
+13. **RTSP is audio-only and TCP-interleaved.** `RTSPStreamSession` SETUPs only the
+    audio `m=` section and asks for `RTP/AVP/TCP;interleaved=0-1`. Don't "add
+    video" (the point is not paying for it) and don't switch to UDP (it would
+    need a second socket, a jitter buffer, and would break under TLS).
+    The reader must keep handling both `$`-framed media and RTSP responses on the
+    same socket — they interleave for the life of the session, not just at setup.
+14. **A listen-only session must not touch the microphone.**
+    `AudioEngine.configure(withCapture: false)` selects `.playback` and skips the
+    tap; `engine.inputNode` must not be accessed at all in that mode (it asserts
+    on the hardware format under `.playback`). `IntercomSession.needsMicrophone`
+    decides, and `enableCapture()` is the in-place upgrade when a real call joins.
+15. **A stream's credentials live in the Keychain, not the roster**
+    (`StreamCredentialStore`). `IntercomDevice.streamURL` is always
+    credential-free — the roster is plain UserDefaults, and it is also what gets
+    published to the watch and read by App Intents.
+16. **`DeviceStore.isSameEndpoint` matches a stream by id only.** Discovery
+    de-duplicates panels by name; a camera and the panel in the same room
+    plausibly share one, and a name match would overwrite the stream's URL and
+    protocol with the panel's.
+17. **Live Activity cleanup:** `CallActivityController.endOrphaned()` runs at
    launch (in `IntercomSession.init`) and activities carry a `staleDate` — both
    prevent an activity getting stuck after a crash/force-quit. `.error`
    connections are cleaned up like `.disconnected` in `handleStateChange`.

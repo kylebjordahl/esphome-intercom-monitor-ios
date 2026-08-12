@@ -11,6 +11,11 @@ import AVFoundation
 //
 // After the initial sequence, additional addPlayerAndDrain() calls are safe.
 //
+// Capture is optional: `configure(withCapture: false)` builds a playback-only
+// graph for a listen-only session (an RTSP monitor), which needs no microphone
+// permission and no recording indicator.  `enableCapture()` upgrades it in place
+// if a real two-way call joins later.
+//
 // Recovery: when the engine stops itself (AVAudioEngineConfigurationChange,
 // route change, interruption), scheduleRestart() performs a full stop/tap-
 // removal before calling startCapture() again, ensuring a clean slate.
@@ -58,6 +63,13 @@ final class AudioEngine {
     private var restartAttempts   = 0
     private var watchdogTimer: Timer?
 
+    /// Whether the microphone is part of the graph.  False for a listen-only
+    /// session: the audio session then uses `.playback` instead of
+    /// `.playAndRecord`, so iOS asks for no microphone permission and shows no
+    /// recording indicator, and `inputNode` is never touched (accessing it under
+    /// `.playback` is what makes the engine assert on a bad HW format).
+    private(set) var isCaptureEnabled = true
+
     var isRunning: Bool { engine.isRunning }
 
     // Diagnostic counters (UI-display only; written on audio + main threads).
@@ -83,12 +95,18 @@ final class AudioEngine {
         }
     }
 
-    func configure() async throws {
-        // 1. Microphone permission.
-        let granted = await withCheckedContinuation { cont in
-            AVAudioApplication.requestRecordPermission { cont.resume(returning: $0) }
+    /// - Parameter withCapture: false for a listen-only session — skips the
+    ///   microphone permission prompt entirely and configures playback only.
+    func configure(withCapture capture: Bool = true) async throws {
+        isCaptureEnabled = capture
+
+        // 1. Microphone permission — only when we actually intend to record.
+        if capture {
+            let granted = await withCheckedContinuation { cont in
+                AVAudioApplication.requestRecordPermission { cont.resume(returning: $0) }
+            }
+            guard granted else { throw ConfigureError.microphoneDenied }
         }
-        guard granted else { throw ConfigureError.microphoneDenied }
 
         // 2. Configure + activate the AVAudioSession.
         try applySessionConfiguration()
@@ -134,6 +152,19 @@ final class AudioEngine {
     /// failure indicates the session was deactivated/reconfigured out from under us.
     private func applySessionConfiguration() throws {
         let s = AVAudioSession.sharedInstance()
+
+        // Listen-only: plain playback, still mixing with whatever is playing and
+        // still eligible for background audio.  Deliberately NOT .playAndRecord
+        // with the mic unused — that would prompt for microphone access and light
+        // the recording indicator for a stream we can only ever listen to.
+        guard isCaptureEnabled else {
+            try s.setCategory(.playback, mode: .default, options: [.mixWithOthers])
+            #if !os(watchOS)
+            try? s.setPreferredSampleRate(44_100)
+            #endif
+            return
+        }
+
         #if os(watchOS)
         // watchOS has no .defaultToSpeaker (and a smaller option set); keep it
         // minimal and let the system route to the watch speaker / paired audio.
@@ -302,12 +333,19 @@ final class AudioEngine {
         // and hard-crashes.  convertAndForward() already rebuilds its converter
         // for whatever format each buffer arrives in, so a changing input rate
         // is handled gracefully.
-        let hwFormat = engine.inputNode.outputFormat(forBus: 0)
-        engine.inputNode.installTap(onBus: 0, bufferSize: 4096, format: nil) { [weak self] buf, _ in
-            self?.convertAndForward(buf)
+        //
+        // Listen-only sessions skip this entirely — `inputNode` must not even be
+        // touched under the .playback category.
+        if isCaptureEnabled {
+            let hwFormat = engine.inputNode.outputFormat(forBus: 0)
+            engine.inputNode.installTap(onBus: 0, bufferSize: 4096, format: nil) { [weak self] buf, _ in
+                self?.convertAndForward(buf)
+            }
+            tapInstalled = true
+            print("AudioEngine: tap installed (format: nil), reported hwFormat=\(hwFormat)")
+        } else {
+            print("AudioEngine: playback-only start — no input tap")
         }
-        tapInstalled = true
-        print("AudioEngine: tap installed (format: nil), reported hwFormat=\(hwFormat)")
 
         do {
             try engine.start()
@@ -318,8 +356,7 @@ final class AudioEngine {
             // Don't give up — retry with backoff so a transient failure (session
             // still settling after an interruption, hardware momentarily busy)
             // self-heals instead of leaving the stream dead until a force-quit.
-            engine.inputNode.removeTap(onBus: 0)
-            tapInstalled = false
+            stopCapture()   // no-op when no tap was installed
             restartAttempts += 1
             // Escalate after the first retry: a start that keeps failing usually
             // means the AVAudioSession itself went stale (a missed interruption
@@ -349,6 +386,40 @@ final class AudioEngine {
             node.play()
         }
         print("AudioEngine: \(playerNodes.count) player node(s) playing")
+    }
+
+    /// Turn a playback-only engine into a full-duplex one, in place.
+    ///
+    /// Happens when a real two-way call joins a session that started as a
+    /// listen-only monitor: the microphone permission is requested at that
+    /// point, the audio session moves to `.playAndRecord`, and the graph is
+    /// rebuilt with the input tap.  A no-op when capture is already enabled.
+    func enableCapture() async throws {
+        guard !isCaptureEnabled else { return }
+
+        let granted = await withCheckedContinuation { cont in
+            AVAudioApplication.requestRecordPermission { cont.resume(returning: $0) }
+        }
+        guard granted else { throw ConfigureError.microphoneDenied }
+
+        isCaptureEnabled = true
+        do {
+            try applySessionConfiguration()
+            try AVAudioSession.sharedInstance().setActive(true,
+                                                         options: .notifyOthersOnDeactivation)
+        } catch {
+            // Roll back: with the flag set but the session still on .playback, the
+            // next restart would touch `inputNode` under a category that asserts.
+            isCaptureEnabled = false
+            try? applySessionConfiguration()
+            throw error
+        }
+        print("AudioEngine: upgrading playback-only session to full duplex")
+        // Full rebuild rather than installing a tap under a running engine: the
+        // category change reconfigures the hardware anyway, and scheduleRestart
+        // is the one path that reliably puts every node back into a playable
+        // state (see its comment).
+        scheduleRestart(delay: 0)
     }
 
     func stopCapture() {
@@ -473,6 +544,9 @@ final class AudioEngine {
         shouldBeRunning = false
         restartAttempts = 0
         lastReportedRunning = false
+        // Back to the default for the next configure(); a stopped engine holds no
+        // session, so nothing is inconsistent while it's down.
+        isCaptureEnabled = true
         watchdogTimer?.invalidate()
         watchdogTimer = nil
         restartTask?.cancel()
@@ -515,8 +589,10 @@ final class AudioEngine {
             guard let self, !Task.isCancelled else { return }
             // Don't resurrect a stopped engine: a late notification (config
             // change, route change) can fire after stop().  shouldBeRunning is
-            // our intent and onCapture is required to forward audio.
-            guard self.shouldBeRunning, self.onCapture != nil else { return }
+            // our intent, and a duplex session also needs onCapture to have
+            // somewhere to forward mic audio (a listen-only one has no mic).
+            guard self.shouldBeRunning,
+                  self.onCapture != nil || !self.isCaptureEnabled else { return }
             print("AudioEngine: restarting after delay=\(delay) ms")
 
             // 1. Stop engine only if it is still running.
