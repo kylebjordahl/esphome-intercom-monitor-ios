@@ -257,6 +257,7 @@ struct StreamEditSheet: View {
     @State private var url: String
     @State private var username: String
     @State private var password: String
+    @State private var go2rtcPort: String = String(Go2RTCStream.defaultRTSPPort)
     @Environment(\.dismiss) private var dismiss
 
     init(device: IntercomDevice?,
@@ -270,20 +271,67 @@ struct StreamEditSheet: View {
         _password = State(initialValue: saved?.password ?? "")
     }
 
+    /// A pasted go2rtc URL (its player is WebRTC, so that's the URL people have)
+    /// is rewritten to the equivalent RTSP restream before anything else looks
+    /// at it — see Go2RTCStream.
+    private var go2rtc: Go2RTCStream? { Go2RTCStream.detect(url) }
+
+    /// Blank means "use the default"; anything unparseable is a real error rather
+    /// than something to silently replace with 8554.
+    private var go2rtcRTSPPort: UInt16? {
+        let text = go2rtcPort.trimmingCharacters(in: .whitespaces)
+        return text.isEmpty ? Go2RTCStream.defaultRTSPPort : UInt16(text)
+    }
+
+    /// What actually gets dialled: the typed URL, or the go2rtc rewrite of it.
+    private var effectiveURL: String {
+        guard let go2rtc else { return url }
+        guard let port = go2rtcRTSPPort else { return "" }
+        return go2rtc.rtspURL(port: port)
+    }
+
     /// Parsed live so the form can show what will actually be dialled — and
     /// refuse to save something that isn't a usable RTSP URL.
-    private var target: RTSPTarget? { RTSPTarget.parse(url) }
+    private var target: RTSPTarget? { RTSPTarget.parse(effectiveURL) }
+
+    /// The saved URL as the user should see it: credential-free, because a
+    /// password doesn't belong on screen next to the field that took it.
+    private var displayURL: String { target?.uri ?? "—" }
 
     var body: some View {
         NavigationStack {
             Form {
-                Section("Stream") {
+                Section {
                     TextField("Name", text: $name)
                     TextField("rtsp://192.168.1.20:554/audio", text: $url)
                         .keyboardType(.URL)
                         .autocorrectionDisabled()
                         .textInputAutocapitalization(.never)
                         .font(.callout.monospaced())
+                } header: {
+                    Text("Stream")
+                } footer: {
+                    Text("An rtsp:// or rtsps:// URL — or a go2rtc/Frigate stream " +
+                         "URL, which is converted for you.")
+                }
+
+                if let go2rtc {
+                    Section {
+                        LabeledContent("Stream", value: go2rtc.streamName)
+                        LabeledContent("RTSP port") {
+                            TextField(String(Go2RTCStream.defaultRTSPPort), text: $go2rtcPort)
+                                .keyboardType(.numberPad)
+                                .multilineTextAlignment(.trailing)
+                        }
+                    } header: {
+                        Text("go2rtc")
+                    } footer: {
+                        Text("go2rtc plays in a browser over WebRTC, which needs a " +
+                             "media stack this app doesn't carry — but it restreams " +
+                             "the same audio over RTSP on port " +
+                             "\(String(Go2RTCStream.defaultRTSPPort)) by default. " +
+                             "That's what gets saved:\n\(displayURL)")
+                    }
                 }
 
                 Section {
@@ -309,7 +357,10 @@ struct StreamEditSheet: View {
                                        value: target.isSecure ? "RTSP over TLS" : "RTSP")
                     }
                 } else if !url.isEmpty {
-                    Label("Not a valid rtsp:// or rtsps:// URL", systemImage: "exclamationmark.triangle")
+                    Label(go2rtc == nil
+                          ? "Not a valid rtsp:// or rtsps:// URL"
+                          : "That go2rtc RTSP port isn't valid",
+                          systemImage: "exclamationmark.triangle")
                         .font(.caption)
                         .foregroundStyle(.orange)
                 }
@@ -324,6 +375,12 @@ struct StreamEditSheet: View {
             }
             .navigationTitle(device == nil ? "Add Audio Stream" : "Edit Audio Stream")
             .navigationBarTitleDisplayMode(.inline)
+            // Paste a go2rtc URL into an unnamed stream and the stream's own name
+            // is the obvious label — it's the one the user already knows it by.
+            .onChange(of: url) { _, newValue in
+                guard name.isEmpty, let detected = Go2RTCStream.detect(newValue) else { return }
+                name = detected.streamName
+            }
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
                 ToolbarItem(placement: .confirmationAction) {

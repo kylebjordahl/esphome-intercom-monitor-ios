@@ -16,7 +16,7 @@ The original motivation was a **nursery monitor**: open a listen-only audio stre
 - **Incoming calls** — the app runs a TCP listener and advertises itself over mDNS, so panels can call *it*. Incoming calls surface as a full-screen answer/decline sheet.
 - **Live Activity** — an active call shows on the Lock Screen and Dynamic Island with a live timer; a single call gets a tap-to-talk button right in the activity.
 - **Home Assistant auto-discovery** — pulls the panel list from an HA phonebook/endpoint sensor over REST + WebSocket, and re-discovers periodically without disturbing live calls.
-- **RTSP audio monitors** — add an `rtsp://` / `rtsps://` stream (an IP camera, a go2rtc/Frigate restream) **by URL** and listen to it exactly like a panel: same background audio, same Live Activity, same per-call volume. Audio only — no video track is ever requested — and listen-only, so a stream-only session never asks for the microphone. See [Monitoring an RTSP audio stream](#monitoring-an-rtsp-audio-stream).
+- **RTSP audio monitors** — add an `rtsp://` / `rtsps://` stream (an IP camera, a go2rtc/Frigate restream — paste a go2rtc **WebRTC** URL and it's converted for you) **by URL** and listen to it exactly like a panel: same background audio, same Live Activity, same per-call volume. Audio only — no video track is ever requested — and listen-only, so a stream-only session never asks for the microphone. See [Monitoring an RTSP audio stream](#monitoring-an-rtsp-audio-stream).
 - **Per-call controls** — speaker mute, per-call volume, and individual hang-up.
 
 ---
@@ -127,6 +127,41 @@ that `AudioEngine` plays. **HE-AAC (SBR/PS), MP4A-LATM, Opus and G.726 are
 refused** with the codec named on the row rather than played as noise. If your
 camera only offers one of those, put [go2rtc](https://github.com/AlexxIT/go2rtc)
 or Frigate in front of it and expose a G.711 or AAC-LC audio track.
+
+### go2rtc and WebRTC streams
+
+go2rtc's player is WebRTC, so the URL you have to hand — from the go2rtc web UI,
+from Frigate, from a dashboard card — usually looks like
+`http://192.168.1.10:1984/api/webrtc?src=nursery`.
+
+**Paste it in anyway.** Any go2rtc URL (`/api/webrtc`, `/api/whep`, `/api/ws`,
+`/api/stream.mp4`, `/stream.html`, …) is recognised by its `src=` parameter and
+converted to the equivalent **RTSP restream** — `rtsp://192.168.1.10:8554/nursery`
+— which is what gets saved. The sheet shows you the converted URL and lets you
+change the RTSP port if go2rtc's `rtsp` module isn't on the default 8554. Any
+credentials in the URL carry over (go2rtc applies the same auth to RTSP) and land
+in the Keychain like any other stream password.
+
+**Why not speak WebRTC directly?** WebRTC media is not "RTP over the web": every
+stream requires ICE candidate gathering and connectivity checks, a DTLS 1.2
+handshake to derive SRTP keys, SRTP decryption on every packet, and an Opus
+decoder. Apple ships none of that — it would mean embedding Google's libwebrtc
+binary (tens of megabytes) and handing it ownership of the audio session, in an
+app whose whole audio path is one carefully-tuned `AVAudioEngine`. go2rtc already
+publishes the identical audio over RTSP, so the WebRTC handshake buys nothing
+here.
+
+**The one case that needs a go2rtc config change:** a stream whose *source* is
+itself WebRTC (a `webrtc:`/WHEP source) carries **Opus** audio, and go2rtc passes
+Opus straight through to RTSP without transcoding it. The app will say
+`Stream audio codec not supported: OPUS`. Add a transcoding stream in
+`go2rtc.yaml` and point the app at that instead:
+
+```yaml
+streams:
+  nursery: webrtc:http://…            # your existing WebRTC source
+  nursery_audio: ffmpeg:nursery#audio=aac   # or #audio=pcma
+```
 
 ---
 
@@ -283,6 +318,7 @@ Sources/
     AudioEngine.swift               The hardened AVAudioEngine — mic↔speaker, 16 kHz PCM
     IntercomProtocol.swift          Wire encode/decode + message factories
     IntercomConnection.swift        One TCP call: state machine, keepalive, PTT gating
+    Go2RTCStream.swift              go2rtc/WebRTC URL → its RTSP restream URL
     RTSPMessage.swift               RTSP requests/responses + Digest/Basic auth
     RTSPAudioFormat.swift           SDP audio-track pick, G.711/L16/AAC unpacking
     RTSPStreamSession.swift         One monitored stream: DESCRIBE/SETUP/PLAY, RTP, retry
@@ -357,6 +393,8 @@ session category (no `.defaultToSpeaker` on watchOS).
 | Stream row says *"Authentication rejected"* | Wrong username/password, or the camera wants a scheme we don't answer (only Digest-MD5 and Basic). Re-enter the credentials in the stream's Edit sheet. |
 | Stream row names a codec | That codec isn't decodable here (e.g. `HE-AAC`, `MP4A-LATM`). Restream through go2rtc/Frigate with a G.711 or AAC-LC audio track. |
 | Stream row says *"Stream has no audio track"* | The URL points at a video-only substream. Most cameras have a separate path/channel with audio, or audio only on the main stream. |
+| go2rtc stream says *"codec not supported: OPUS"* | The source is WebRTC-native; go2rtc doesn't transcode Opus to RTSP. Add `ffmpeg:<stream>#audio=aac` in `go2rtc.yaml` and point the app at that stream. |
+| go2rtc URL saved but nothing connects | go2rtc's `rtsp` module may be disabled or moved off 8554 — set the RTSP port in the stream's Edit sheet, and check `rtsp: listen:` in `go2rtc.yaml`. |
 | Stream connects but there's no sound | Check the speaker isn't muted for that row, and that the camera's microphone is enabled — an audio track can be present and silent. |
 
 ---

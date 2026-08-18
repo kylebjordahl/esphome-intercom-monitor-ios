@@ -773,6 +773,57 @@ do {
                "bare host/path defaults to rtsp://")
 }
 
+// MARK: - go2rtc URL adaptation
+
+print("\nGo2RTCStream")
+do {
+    // The URL people actually have is the WebRTC one — the go2rtc player is
+    // WebRTC, so that's what the web UI and Frigate hand out.
+    let webrtc = Go2RTCStream.detect("http://192.168.1.10:1984/api/webrtc?src=nursery")
+    checkEqual(webrtc?.host, "192.168.1.10", "host from the API URL")
+    checkEqual(webrtc?.streamName, "nursery", "stream name from src=")
+    checkEqual(webrtc?.rtspURL(), "rtsp://192.168.1.10:8554/nursery",
+               "rewritten to the RTSP restream on go2rtc's default port")
+
+    // Every go2rtc endpoint addresses a stream the same way, so all of them work.
+    for path in ["/api/whep?src=nursery", "/api/ws?src=nursery",
+                 "/stream.html?src=nursery&mode=webrtc",
+                 "/api/stream.mp4?src=nursery"] {
+        checkEqual(Go2RTCStream.detect("http://go2rtc.local:1984\(path)")?.streamName,
+                   "nursery", "recognises \(path)")
+    }
+
+    // An RTSP URL already works — rewriting one would be second-guessing the user.
+    check(Go2RTCStream.detect("rtsp://192.168.1.10:8554/nursery") == nil,
+          "an rtsp:// URL is left alone")
+    check(Go2RTCStream.detect("http://192.168.1.10:1984/") == nil,
+          "a URL with no src= is not a go2rtc stream")
+    check(Go2RTCStream.detect("http://example.com/page?srcset=x") == nil,
+          "src= must be the whole parameter name")
+
+    // A non-default RTSP port (go2rtc's rtsp module can be moved).
+    checkEqual(webrtc?.rtspURL(port: 18554), "rtsp://192.168.1.10:18554/nursery",
+               "honours a moved RTSP port")
+
+    // go2rtc applies the same auth to its RTSP server, so credentials carry over
+    // — and are split back into the Keychain by the RTSP parser on save.
+    let authed = Go2RTCStream.detect("https://user:p%40ss@go2rtc.local/api/webrtc?src=back%20door")
+    checkEqual(authed?.username, "user", "username from the URL")
+    checkEqual(authed?.password, "p@ss", "percent-decoded password")
+    checkEqual(authed?.streamName, "back door", "percent-decoded stream name")
+    let derived = authed?.rtspURL() ?? ""
+    check(derived.hasPrefix("rtsp://user:p%40ss@go2rtc.local:8554/"), "credentials re-encoded")
+    check(derived.hasSuffix("/back%20door"), "stream name re-encoded for the path")
+    checkEqual(RTSPTarget.parse(derived)?.password, "p@ss",
+               "the derived URL round-trips through the RTSP parser")
+    checkEqual(RTSPTarget.parse(derived)?.uri, "rtsp://go2rtc.local:8554/back%20door",
+               "and the saved URI carries no credentials")
+
+    // A stream name containing a path separator must not escape its path segment.
+    checkEqual(Go2RTCStream(host: "h", streamName: "a/b", username: nil, password: nil)
+        .rtspURL(), "rtsp://h:8554/a%2Fb", "escapes a slash in the stream name")
+}
+
 // MARK: - RTSP messages
 
 print("\nRTSPMessage")

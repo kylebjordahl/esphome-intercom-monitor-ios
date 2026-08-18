@@ -90,6 +90,10 @@ VoIP layer, all in `Sources/Shared`:
 
 RTSP monitoring layer, also in `Sources/Shared`:
 
+- `Go2RTCStream` — recognises a go2rtc URL (any endpoint; they all use `src=`) and
+  rewrites it to that stream's RTSP restream, so a user can paste the WebRTC URL
+  they actually have. There is no WebRTC stack here and adding one would mean
+  embedding libwebrtc — don't; go2rtc already publishes the same audio over RTSP.
 - `RTSPMessage` — request encoding, response parsing, Digest/Basic auth.
 - `RTSPAudioFormat` — SDP audio-track selection, AAC config, AU headers, G.711.
 - `RTSPStreamSession` — one stream: TCP/TLS socket, DESCRIBE/SETUP/PLAY, the

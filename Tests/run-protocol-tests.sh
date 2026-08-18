@@ -19,6 +19,7 @@ trap 'rm -rf "$OUT"' EXIT
 
 swiftc -o "$OUT/protocoltests" -swift-version 5 \
   "$SHARED/VoipAudioFormat.swift" \
+  "$SHARED/Go2RTCStream.swift" \
   "$SHARED/RTSPMessage.swift" \
   "$SHARED/RTSPAudioFormat.swift" \
   "$SHARED/RTSPAudioDecoder.swift" \
