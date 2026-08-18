@@ -28,8 +28,9 @@ final class WatchIntercomSession: NSObject, ObservableObject {
 
         // Configure + start the shared engine once with zero players (mirrors the
         // iOS flow), then attach one player per call.  configure() awaits the
-        // microphone-permission prompt, so this is async.
-        try await audioEngine.configure()
+        // microphone-permission prompt, so this is async — and skips it entirely
+        // when everything selected is a listen-only RTSP stream.
+        try await audioEngine.configure(withCapture: devices.contains { !$0.isListenOnly })
 
         audioEngine.onCapture = { [weak self] data in
             Task { @MainActor [weak self] in
@@ -82,6 +83,7 @@ final class WatchIntercomSession: NSObject, ObservableObject {
     /// Tap-to-talk; mutes this call's incoming audio while talking to avoid an
     /// acoustic feedback loop (half-duplex).
     func toggleTalk(for conn: IntercomConnection) {
+        guard !conn.isListenOnly else { return }
         conn.isTalking.toggle()
         applyPlaybackVolume(for: conn)
     }

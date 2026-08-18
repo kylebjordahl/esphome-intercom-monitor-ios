@@ -77,6 +77,10 @@ private struct CallControls: View {
                 TalkButton(state: state)
                 HangupButton(connectionId: state.primaryId, label: "End", expand: false)
             }
+        } else if state.activeCount == 1 {
+            // A single listen-only stream: there's nothing to talk to, so the
+            // whole row is the stop control.
+            HangupButton(connectionId: state.primaryId, label: "Stop", expand: true)
         } else {
             HangupButton(connectionId: "", label: "End All", expand: true)
         }
@@ -132,7 +136,7 @@ private struct LockScreenView: View {
                     Text(state.primaryName)
                         .font(.headline)
                         .lineLimit(1)
-                    Text(state.activeCount == 1 ? "Intercom call" : "\(state.activeCount) intercom calls")
+                    Text(state.subtitle)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -146,7 +150,7 @@ private struct LockScreenView: View {
 
             CallControls(state: state)
 
-            if !state.showsTalkButton {
+            if !state.showsTalkButton, state.activeCount > 1 {
                 Text("Open the app to talk to a specific call")
                     .font(.caption2)
                     .foregroundStyle(.secondary)

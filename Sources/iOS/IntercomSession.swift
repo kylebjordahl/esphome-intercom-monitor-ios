@@ -47,8 +47,10 @@ final class IntercomSession: NSObject, ObservableObject {
     let sipEndpoint = SIPEndpoint.shared
     private let callActivity = CallActivityController()
 
-    private var isAudioRunning     = false
-    private var isAudioConfiguring = false   // guard against concurrent ensureAudioConfigured() calls
+    private var isAudioRunning = false
+    /// The one in-flight audio configuration, so concurrent callers coalesce onto
+    /// it instead of racing (see ensureAudioConfigured).
+    private var audioConfigureTask: Task<Void, Never>?
 
     // Combine: keep one AnyCancellable per connection keyed by connection id.
     private var cancellables     = Set<AnyCancellable>()
@@ -350,14 +352,17 @@ final class IntercomSession: NSObject, ObservableObject {
         callActivity.sync(activeCount: active.count,
                           primaryName: primary?.device.name ?? "",
                           primaryId: primary?.id.uuidString ?? "",
-                          isTalking: primary?.isTalking ?? false)
+                          isTalking: primary?.isTalking ?? false,
+                          isListenOnly: primary?.isListenOnly ?? false)
     }
 
     // MARK: - Push-to-talk
 
     /// Open or close the mic for a specific connection (app press-and-hold).
     func setTalking(_ talking: Bool, for conn: IntercomConnection) {
-        guard conn.isTalking != talking else { return }
+        // An RTSP monitor has no return path; letting isTalking flip would only
+        // mute its playback (half-duplex) for no reason.
+        guard !conn.isListenOnly, conn.isTalking != talking else { return }
         conn.isTalking = talking
         applyPlaybackVolume(for: conn)   // half-duplex: mute incoming while talking
         syncLiveActivity()
@@ -366,7 +371,8 @@ final class IntercomSession: NSObject, ObservableObject {
     /// Toggle push-to-talk for a connection id — invoked by the Live Activity
     /// talk button via the .intercomToggleTalk notification.
     private func toggleTalk(connectionId: String) {
-        guard let conn = connections.first(where: { $0.id.uuidString == connectionId })
+        guard let conn = connections.first(where: { $0.id.uuidString == connectionId }),
+              !conn.isListenOnly
         else { return }
         conn.isTalking.toggle()
         applyPlaybackVolume(for: conn)
@@ -385,17 +391,38 @@ final class IntercomSession: NSObject, ObservableObject {
 
     // MARK: - Private: audio engine
 
+    /// Whether the engine must own the microphone: true as soon as one active
+    /// connection can transmit.  A session made up only of RTSP monitors runs
+    /// playback-only and never prompts for microphone access.
+    private var needsMicrophone: Bool {
+        connections.contains { $0.state == .active && !$0.isListenOnly }
+    }
+
     private func ensureAudioConfigured() async {
         // On @MainActor, two Tasks can both see isAudioRunning=false before the
-        // first one sets it true (they interleave at await suspension points).
-        // isAudioConfiguring guards the critical section.
-        guard !isAudioRunning, !isAudioConfiguring else { return }
-        isAudioConfiguring = true
-        defer { isAudioConfiguring = false }
+        // first one sets it true (they interleave at await suspension points), so
+        // the second caller has to *wait* for the first configuration rather than
+        // skip it — skipping left that connection with no player node, and
+        // therefore silent, for the rest of the call.
+        if let inFlight = audioConfigureTask {
+            await inFlight.value
+        } else if !isAudioRunning {
+            let task = Task { @MainActor [weak self] in await self?.configureAudio() }
+            audioConfigureTask = task
+            await task.value
+            audioConfigureTask = nil
+        }
+        // A two-way call may have joined a listen-only session that is already up.
+        await enableCaptureIfNeeded()
+    }
+
+    private func configureAudio() async {
+        // Listen-only sessions (nothing but RTSP monitors) skip the mic entirely.
+        let withCapture = needsMicrophone
         audioStatus = .starting
 
         do {
-            try await audioEngine.configure()
+            try await audioEngine.configure(withCapture: withCapture)
         } catch {
             print("IntercomSession: audio configure FAILED — \(error)")
             audioStatus = .failed(error.localizedDescription)
@@ -448,14 +475,31 @@ final class IntercomSession: NSObject, ObservableObject {
         // session: the UI stayed "Failed" and teardown/reconfigure got confused.
         isAudioRunning = true
         audioStatus    = audioEngine.isRunning ? .running : .starting
-        print("IntercomSession: audio engine start requested (running=\(audioEngine.isRunning))")
+        print("IntercomSession: audio engine start requested " +
+              "(running=\(audioEngine.isRunning), microphone=\(withCapture))")
+    }
+
+    /// Bring the microphone into a session that started listen-only.
+    ///
+    /// A denied prompt is deliberately NOT a failure: the user can still *hear*
+    /// the call they just placed, which is most of the value, so keep the engine
+    /// running and only lose push-to-talk.
+    private func enableCaptureIfNeeded() async {
+        guard isAudioRunning, needsMicrophone, !audioEngine.isCaptureEnabled else { return }
+        do {
+            try await audioEngine.enableCapture()
+        } catch {
+            print("IntercomSession: microphone upgrade FAILED — \(error) " +
+                  "(listening continues, push-to-talk unavailable)")
+        }
     }
 
     private func teardownAudio() {
         // Clear intent first so any late onRunningStateChanged callback from the
         // engine winding down is ignored (it guards on isAudioRunning).
-        isAudioRunning     = false
-        isAudioConfiguring = false
+        isAudioRunning = false
+        audioConfigureTask?.cancel()
+        audioConfigureTask = nil
         audioEngine.onRunningStateChanged = nil
         audioEngine.stop()
         audioEngine.deactivate()

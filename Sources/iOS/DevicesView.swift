@@ -11,7 +11,8 @@ struct DevicesView: View {
     @AppStorage("callerName") private var callerName = "iPhone"
 
     @State private var selectedIds: Set<UUID> = []
-    @State private var showAddSheet   = false
+    @State private var showAddSheet       = false
+    @State private var showAddStreamSheet = false
     @State private var editingDevice: IntercomDevice? = nil
     @State private var editMode       = EditMode.inactive
 
@@ -34,7 +35,8 @@ struct DevicesView: View {
                         ContentUnavailableView(
                             "No Devices",
                             systemImage: "phone.badge.plus",
-                            description: Text("Add devices manually or configure Home Assistant in Settings.")
+                            description: Text("Add a panel or an audio stream with ＋, " +
+                                              "or configure Home Assistant in Settings.")
                         )
                     } else {
                         ForEach(deviceStore.devices) { device in
@@ -67,7 +69,20 @@ struct DevicesView: View {
                         }
                     }
                     if editMode == .inactive {
-                        Button { showAddSheet = true } label: {
+                        // Two kinds of endpoint, added two different ways: a panel
+                        // by host/port, a stream by URL (nothing discovers one).
+                        Menu {
+                            Button {
+                                showAddSheet = true
+                            } label: {
+                                Label("Intercom Panel", systemImage: "phone.badge.plus")
+                            }
+                            Button {
+                                showAddStreamSheet = true
+                            } label: {
+                                Label("Audio Stream by URL", systemImage: "link.badge.plus")
+                            }
+                        } label: {
                             Label("Add", systemImage: "plus")
                         }
                     }
@@ -84,7 +99,7 @@ struct DevicesView: View {
                             // Leave edit mode after initiating the call.
                             withAnimation { editMode = .inactive }
                         } label: {
-                            Label(callButtonLabel, systemImage: "phone.fill")
+                            Label(callButtonLabel, systemImage: callButtonIcon)
                         }
                         .buttonStyle(.borderedProminent)
                     }
@@ -95,9 +110,24 @@ struct DevicesView: View {
                     deviceStore.add(newDevice)
                 }
             }
+            .sheet(isPresented: $showAddStreamSheet) {
+                StreamEditSheet(device: nil) { newDevice, credentials in
+                    StreamCredentialStore.save(credentials, for: newDevice.id)
+                    deviceStore.add(newDevice)
+                }
+            }
             .sheet(item: $editingDevice) { device in
-                DeviceEditSheet(device: device) { updated in
-                    deviceStore.update(updated)
+                // A stream is edited by URL, a panel by host/port — same entry
+                // point, different form.
+                if device.isAudioStream {
+                    StreamEditSheet(device: device) { updated, credentials in
+                        StreamCredentialStore.save(credentials, for: updated.id)
+                        deviceStore.update(updated)
+                    }
+                } else {
+                    DeviceEditSheet(device: device) { updated in
+                        deviceStore.update(updated)
+                    }
                 }
             }
         }
@@ -110,7 +140,20 @@ struct DevicesView: View {
         if session.isCallActive {
             return n == 1 ? "Add to Call" : "Add \(n) to Call"
         }
+        // Nothing is being "called" when every selection is a one-way stream.
+        if selectedDevices.allSatisfy(\.isAudioStream), !selectedDevices.isEmpty {
+            return n == 1 ? "Listen" : "Listen to \(n)"
+        }
         return n == 1 ? "Call" : "Call \(n)"
+    }
+
+    private var callButtonIcon: String {
+        selectedDevices.allSatisfy(\.isAudioStream) && !selectedDevices.isEmpty
+            ? "ear.fill" : "phone.fill"
+    }
+
+    private var selectedDevices: [IntercomDevice] {
+        deviceStore.devices.filter { selectedIds.contains($0.id) }
     }
 
     private func activeConnectionState(for device: IntercomDevice) -> ConnectionState? {
@@ -118,8 +161,7 @@ struct DevicesView: View {
     }
 
     private func callSelected() {
-        let targets = deviceStore.devices.filter { selectedIds.contains($0.id) }
-        session.startCall(to: targets, callerName: callerName)
+        session.startCall(to: selectedDevices, callerName: callerName)
         selectedIds.removeAll()
     }
 }
@@ -132,7 +174,11 @@ private struct DeviceRow: View {
 
     var body: some View {
         HStack {
-            if let groupKind = device.groupKind {
+            if device.isAudioStream {
+                Image(systemName: "waveform.badge.magnifyingglass")
+                    .foregroundStyle(.secondary)
+                    .frame(width: 20)
+            } else if let groupKind = device.groupKind {
                 Image(systemName: groupKind == .ring ? "person.2.wave.2" : "person.3")
                     .foregroundStyle(.secondary)
                     .frame(width: 20)
@@ -142,6 +188,8 @@ private struct DeviceRow: View {
                 Text(subtitle)
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
             }
             Spacer()
             if let state = isActive {
@@ -154,6 +202,11 @@ private struct DeviceRow: View {
     // A group's `host`/`port` are Home Assistant's own SIP listener, not
     // meaningful to the user — show what the group actually is instead.
     private var subtitle: String {
+        // For a stream the URL is the identity (host and port alone can't tell
+        // two streams from the same camera apart).
+        if device.isAudioStream {
+            return device.streamURL ?? "RTSP audio stream"
+        }
         guard let groupKind = device.groupKind else { return "\(device.host):\(device.port)" }
         let kind = groupKind == .ring ? "Ring group" : "Conference"
         let count = device.groupMembers.count
@@ -185,6 +238,178 @@ private struct DeviceRow: View {
         default:
             EmptyView()
         }
+    }
+}
+
+// MARK: - Stream edit sheet
+
+/// Add or edit an RTSP/RTSPS audio stream.
+///
+/// Streams are URL-based and cannot be discovered — Home Assistant knows nothing
+/// about a camera's RTSP endpoint — so this is the only way one enters the roster.
+/// Credentials are handed back separately from the device so they land in the
+/// Keychain rather than in the plain-text roster (see `StreamCredentialStore`).
+struct StreamEditSheet: View {
+    let device: IntercomDevice?
+    let onSave: (IntercomDevice, StreamCredentials?) -> Void
+
+    @State private var name: String
+    @State private var url: String
+    @State private var username: String
+    @State private var password: String
+    @State private var go2rtcPort: String = String(Go2RTCStream.defaultRTSPPort)
+    @Environment(\.dismiss) private var dismiss
+
+    init(device: IntercomDevice?,
+         onSave: @escaping (IntercomDevice, StreamCredentials?) -> Void) {
+        self.device = device
+        self.onSave = onSave
+        _name = State(initialValue: device?.name ?? "")
+        _url  = State(initialValue: device?.streamURL ?? "")
+        let saved = device.flatMap { StreamCredentialStore.load(for: $0.id) }
+        _username = State(initialValue: saved?.username ?? "")
+        _password = State(initialValue: saved?.password ?? "")
+    }
+
+    /// A pasted go2rtc URL (its player is WebRTC, so that's the URL people have)
+    /// is rewritten to the equivalent RTSP restream before anything else looks
+    /// at it — see Go2RTCStream.
+    private var go2rtc: Go2RTCStream? { Go2RTCStream.detect(url) }
+
+    /// Blank means "use the default"; anything unparseable is a real error rather
+    /// than something to silently replace with 8554.
+    private var go2rtcRTSPPort: UInt16? {
+        let text = go2rtcPort.trimmingCharacters(in: .whitespaces)
+        return text.isEmpty ? Go2RTCStream.defaultRTSPPort : UInt16(text)
+    }
+
+    /// What actually gets dialled: the typed URL, or the go2rtc rewrite of it.
+    private var effectiveURL: String {
+        guard let go2rtc else { return url }
+        guard let port = go2rtcRTSPPort else { return "" }
+        return go2rtc.rtspURL(port: port)
+    }
+
+    /// Parsed live so the form can show what will actually be dialled — and
+    /// refuse to save something that isn't a usable RTSP URL.
+    private var target: RTSPTarget? { RTSPTarget.parse(effectiveURL) }
+
+    /// The saved URL as the user should see it: credential-free, because a
+    /// password doesn't belong on screen next to the field that took it.
+    private var displayURL: String { target?.uri ?? "—" }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    TextField("Name", text: $name)
+                    TextField("rtsp://192.168.1.20:554/audio", text: $url)
+                        .keyboardType(.URL)
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
+                        .font(.callout.monospaced())
+                } header: {
+                    Text("Stream")
+                } footer: {
+                    Text("An rtsp:// or rtsps:// URL — or a go2rtc/Frigate stream " +
+                         "URL, which is converted for you.")
+                }
+
+                if let go2rtc {
+                    Section {
+                        LabeledContent("Stream", value: go2rtc.streamName)
+                        LabeledContent("RTSP port") {
+                            TextField(String(Go2RTCStream.defaultRTSPPort), text: $go2rtcPort)
+                                .keyboardType(.numberPad)
+                                .multilineTextAlignment(.trailing)
+                        }
+                    } header: {
+                        Text("go2rtc")
+                    } footer: {
+                        Text("go2rtc plays in a browser over WebRTC, which needs a " +
+                             "media stack this app doesn't carry — but it restreams " +
+                             "the same audio over RTSP on port " +
+                             "\(String(Go2RTCStream.defaultRTSPPort)) by default. " +
+                             "That's what gets saved:\n\(displayURL)")
+                    }
+                }
+
+                Section {
+                    TextField("Username", text: $username)
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
+                    SecureField("Password", text: $password)
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
+                } header: {
+                    Text("Credentials")
+                } footer: {
+                    Text("Stored in the Keychain, not with the device list. " +
+                         "A username and password pasted into the URL is moved " +
+                         "here automatically.")
+                }
+
+                if let target {
+                    Section("Will connect to") {
+                        LabeledContent("Host", value: target.host)
+                        LabeledContent("Port", value: String(target.port))
+                        LabeledContent("Transport",
+                                       value: target.isSecure ? "RTSP over TLS" : "RTSP")
+                    }
+                } else if !url.isEmpty {
+                    Label(go2rtc == nil
+                          ? "Not a valid rtsp:// or rtsps:// URL"
+                          : "That go2rtc RTSP port isn't valid",
+                          systemImage: "exclamationmark.triangle")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
+
+                Section {
+                    Text("Audio only — no video track is requested, so the camera " +
+                         "sends nothing but sound. Listen-only: there is no way to " +
+                         "talk back over RTSP.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .navigationTitle(device == nil ? "Add Audio Stream" : "Edit Audio Stream")
+            .navigationBarTitleDisplayMode(.inline)
+            // Paste a go2rtc URL into an unnamed stream and the stream's own name
+            // is the obvious label — it's the one the user already knows it by.
+            .onChange(of: url) { _, newValue in
+                guard name.isEmpty, let detected = Go2RTCStream.detect(newValue) else { return }
+                name = detected.streamName
+            }
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Save") { save() }
+                        .disabled(name.isEmpty || target == nil)
+                }
+            }
+        }
+    }
+
+    private func save() {
+        guard let target else { return }
+
+        // Typed fields win; otherwise fall back to credentials pasted in the URL
+        // (which `target.uri` has already stripped out).
+        var credentials = StreamCredentials(username: username, password: password)
+        if credentials.isEmpty, let user = target.username {
+            credentials = StreamCredentials(username: user, password: target.password ?? "")
+        }
+
+        var updated = device ?? IntercomDevice(name: name, host: target.host,
+                                               protocolKind: .rtsp)
+        updated.name         = name
+        updated.host         = target.host
+        updated.port         = Int(target.port)
+        updated.protocolKind = .rtsp
+        updated.streamURL    = target.uri
+        onSave(updated, credentials.isEmpty ? nil : credentials)
+        dismiss()
     }
 }
 
@@ -224,7 +449,9 @@ struct DeviceEditSheet: View {
 
                 Section {
                     Picker("Protocol", selection: $protocolKind) {
-                        ForEach(DeviceProtocol.allCases, id: \.self) { kind in
+                        // `.rtsp` is not offered here — a stream is added by URL
+                        // through StreamEditSheet, not by re-typing a panel.
+                        ForEach(DeviceProtocol.panelCases, id: \.self) { kind in
                             Text(kind.label).tag(kind)
                         }
                     }

@@ -141,13 +141,17 @@ private struct WatchConnectionRow: View {
             if conn.state == .active {
                 HStack(spacing: 8) {
                     // Push-to-talk: tap to open the mic, tap again to go silent.
-                    Button {
-                        watchSession.toggleTalk(for: conn)
-                    } label: {
-                        Image(systemName: conn.isTalking ? "mic.fill" : "mic.slash.fill")
-                            .foregroundStyle(conn.isTalking ? .green : .secondary)
+                    // A monitored RTSP stream has no return path, so it gets no
+                    // mic button at all.
+                    if !conn.isListenOnly {
+                        Button {
+                            watchSession.toggleTalk(for: conn)
+                        } label: {
+                            Image(systemName: conn.isTalking ? "mic.fill" : "mic.slash.fill")
+                                .foregroundStyle(conn.isTalking ? .green : .secondary)
+                        }
+                        .buttonStyle(.plain)
                     }
-                    .buttonStyle(.plain)
 
                     Button {
                         watchSession.toggleSpeakerMute(for: conn)
